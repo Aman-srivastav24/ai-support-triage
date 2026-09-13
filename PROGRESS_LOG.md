@@ -90,3 +90,95 @@ No token expiry to manage, and it matches what most workplaces use.
 - Confirm Python extension installed on the WSL side of VS Code
 - Groq has no embeddings endpoint — Day 3 will need a second provider for embeddings.
   Decide on Day 3, not before.
+
+  ## Day 1 — Backend spine
+
+**Date:** 13 Sep 2026
+
+### Built
+
+- `docs/ARCHITECTURE.md` — data model with columns, three request flows as
+  sequence diagrams, data-flow diagram, seven failure modes with decisions,
+  decision/alternative table. Six Mermaid diagrams rendering on GitHub.
+- Layered package layout: `app/api`, `core`, `db`, `models`, `schemas`, `services`
+- `pyproject.toml` with pinned-minimum dependencies, `[dev]` extras, editable install
+- `app/core/config.py` — `pydantic-settings`, `.env` locally, env vars in containers
+- `Dockerfile` (`python:3.14-slim`), `.dockerignore`, `docker-compose.yml`
+  (app + `pgvector/pgvector:pg16` + `redis:7-alpine`) with healthchecks and
+  `depends_on: service_healthy`
+- `app/db/session.py` — engine with `pool_pre_ping`, session factory, `get_db` dependency
+- Five SQLAlchemy 2.0 models: `User`, `Document`, `Chunk`, `Ticket`, `TicketCitation`
+  with UUID PKs, `TIMESTAMPTZ`, named check constraints, explicit `ON DELETE` rules
+- Alembic wired to `Base.metadata` and app settings; first migration reviewed and applied
+- `GET /health` checking Postgres and Redis, returning 503 when degraded
+- Full stack up under Compose; `/health` green from inside the container
+
+### What broke
+
+**1. `ImportError: cannot import name 'Chunk'`**
+File existed, class was visible in the editor, Python couldn't find it. Unsaved
+VS Code buffer — the file on disk was empty. Save All, re-run, fixed.
+Lesson: the editor shows the buffer; Python reads the disk.
+
+**2. VS Code Server re-download on `code .`**
+Windows VS Code had updated, so the Linux-side server had to match. One-time per
+update, not per launch. Also opened `docs/` as workspace root by running `code .`
+from the wrong directory — reopened from project root.
+
+**3. `grep: .gitignore: No such file or directory`**
+Ran from `app/core/`. Git, pip, Compose, Alembic, uvicorn all resolve config
+relative to the current directory. Rule adopted: run everything from project root.
+
+**4. Port collision risk with Windows Postgres 18.1**
+A separate Postgres already listens on 5432 on the Windows side. Mapped the
+container to `5433:5432` on the host rather than uninstalling. Windows install
+left in place, unused.
+
+### Decisions
+
+**`pgvector/pgvector:pg16` instead of `postgres:16`**
+Same Postgres 16, pgvector extension precompiled. Day 3 becomes
+`CREATE EXTENSION vector` in a migration rather than an image swap and volume reset.
+
+**`pydantic-settings` pulled forward from Day 5**
+Needed `DATABASE_URL` from env on Day 1. `database_url` has no default so the app
+refuses to start unconfigured; `redis_url` has a default because Redis is non-critical.
+
+**`VARCHAR` + named `CheckConstraint` over Postgres `ENUM`**
+`ALTER TYPE` is awkward inside Alembic's transaction; removing enum values is
+near-impossible. Ticket statuses change on Days 4 and 10. Python `StrEnum` carries
+the type safety; the DB constraint carries the guarantee.
+
+**Python-side `uuid.uuid4` default, not `gen_random_uuid()`**
+ID is known before flush, which Flows A and B need for scheduling background work
+and returning the ID. Deviation from ARCHITECTURE.md noted there.
+
+**`/health` returns 503 when degraded**
+Load balancers read status codes, not JSON bodies. `200 + "degraded"` would keep
+traffic flowing to a broken instance.
+
+**Two `DATABASE_URL`s, one database**
+`.env` → `localhost:5433` (host, through port mapping). Compose `environment` →
+`db:5432` (container-to-container over the Compose network). `localhost` inside a
+container is that container.
+
+**No `embedding` column yet**
+Deferred to Day 3 so the migration there teaches adding an extension and an
+indexed column to a populated table — the migration you write at work.
+
+### Numbers
+
+| Metric | Value |
+|---|---|
+| Image build (first, with `pip install`) | 18.0 s total, 14.0 s in pip |
+| Postgres in container | 16.15 |
+| Tables / indexes / FKs / check constraints | 5 / 4 / 5 / 4 |
+| Migration revision | `d6928171bf12` |
+| `/health` under Compose | `{"status":"ok","checks":{"database":"ok","redis":"ok"}}` |
+
+### Open items
+
+- Windows Postgres 18.1 still installed and running; harmless, could be removed
+- `alembic.ini` `sqlalchemy.url` line removed — confirm it's not in the commit
+- Day 2: JWT + bcrypt + `get_current_user`; document upload with chunking as a
+  background task. Chunking needs a tokenizer — `tiktoken` already verified on 3.14.
