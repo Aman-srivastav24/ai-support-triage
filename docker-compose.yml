@@ -34,6 +34,7 @@ services:
       DATABASE_URL: postgresql+psycopg://triage:triage@db:5432/triage
       REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: development
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set}
     volumes:
       - ./app:/code/app
     depends_on:

@@ -13,6 +13,10 @@ dependencies = [
     "pydantic-settings>=2.5",
     "pydantic[email]",
     "redis>=5.0",
+    "bcrypt>=4.2",
+    "pyjwt>=2.9",
+    "email-validator>=2.2",
+    "python-multipart>=0.0.12",
 ]
 
 [project.optional-dependencies]
