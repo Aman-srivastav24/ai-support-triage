@@ -182,3 +182,202 @@ indexed column to a populated table — the migration you write at work.
 - `alembic.ini` `sqlalchemy.url` line removed — confirm it's not in the commit
 - Day 2: JWT + bcrypt + `get_current_user`; document upload with chunking as a
   background task. Chunking needs a tokenizer — `tiktoken` already verified on 3.14.
+
+  ## Day 2 — Auth and ingestion
+
+**Date:** 16 Sep 2026
+
+### Built
+
+- `app/core/security.py` — bcrypt hashing (cost 12), JWT mint/verify with PyJWT,
+  custom `TokenError`. Only module importing `bcrypt` or `jwt`.
+- `app/core/config.py` — added `jwt_secret_key` (no default), `jwt_algorithm`,
+  `jwt_expiry_minutes`
+- `app/schemas/user.py` — `UserRegister`, `UserRead`, `Token`
+- `app/services/auth.py` — `create_user`, `authenticate_user`, `get_user_by_email`;
+  `EmailAlreadyRegistered`, `InvalidCredentials`
+- `app/api/deps.py` — `get_current_user`, `require_admin`, and the `DbSession` /
+  `CurrentUser` / `AdminUser` Annotated aliases
+- `app/api/auth.py` — `POST /auth/register` (201), `POST /auth/login` (200),
+  `GET /auth/me`
+- `app/services/chunking.py` — `chunk_text` with tiktoken, 500-token windows,
+  50-token overlap, frozen `TextChunk` dataclass
+- `app/services/documents.py` — `create_document` (SHA-256 dedup) and
+  `ingest_document` (own session, pending → processing → ready/failed)
+- `app/schemas/document.py` — `DocumentRead`, excluding `raw_text` and `content_sha256`
+- `app/api/documents.py` — `POST /documents` (202, admin only, background task),
+  `GET /documents/{id}`
+- No model or migration changes — Day 1's `User`, `Document` and `Chunk` already
+  carried every column auth and ingestion needed
+
+### What broke
+
+**1. Container died on startup: `jwt_secret_key Field required`**
+`.env` had the key; the container didn't. `.dockerignore` excludes `.env` (correctly —
+secrets must not be baked into an image), so the container only sees what Compose's
+`environment:` block passes it. Fixed with
+`JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set}` — Compose substitutes
+from the host `.env` and refuses to start if it's missing.
+Rule: every new setting goes in two places — `.env` for local, Compose `environment:`
+for the container.
+
+**2. `ModuleNotFoundError: No module named 'tiktoken'`**
+Installed into the venv on Day 0 during the Python 3.14 compatibility check, never
+declared in `pyproject.toml`. The venv accumulates whatever you've ever installed;
+the image is built only from what's declared. Textbook "works on my machine".
+Fixed by adding `tiktoken>=0.8` and rebuilding.
+
+**3. `http://localhost:8000` unreachable from the Windows browser**
+The app was healthy — `curl` from inside WSL returned 200. Windows resolves
+`localhost` to IPv6 `::1` first, and WSL2's port forwarding only listens on IPv4.
+Use `http://127.0.0.1:8000`. Same root cause family as the Day 0 apt IPv6 failure.
+
+**4. `Could not validate credentials` on a curl request**
+`$TOKEN` was never set in that shell — the upload had been done through `/docs`,
+which holds its own token. Not a bug: the flat 401 message is deliberate and gives
+no hint whether the token was missing, expired or forged.
+
+### Decisions
+
+**`bcrypt` directly, not `passlib`**
+`passlib`'s last release was 2020 and it breaks against modern bcrypt (reaches for
+`bcrypt.__about__.__version__`, removed upstream). Same reasoning for `pyjwt` over
+`python-jose` — the latter is barely maintained and has had CVEs.
+
+**`get_current_user` hits the database on every request**
+The token already carries `sub` and `role`, so the lookup is skippable. Kept it
+because it's what makes `is_active` and role changes take effect immediately rather
+than at token expiry. Cost: one indexed primary-key read per request.
+Verified live — promoting a user to admin worked with their existing agent-role token.
+Corollary: the `role` claim in the JWT is for frontend display only. Authorisation
+reads the database.
+
+**60-minute token expiry**
+JWTs can't be revoked before expiry, so lifetime is the worst-case exposure window.
+60 min balances that against re-login friction. `is_active` covers the urgent case.
+
+**Timing-attack defence on login**
+An unknown email returns in ~1ms while a wrong password costs a bcrypt hash (~360ms).
+That gap leaks which emails have accounts (user enumeration). Unknown emails are now
+hashed against a dummy bcrypt string so both paths cost the same.
+All three failure modes — no such user, wrong password, deactivated — raise the same
+`InvalidCredentials` and return the same message.
+
+**Known gap: `POST /auth/register` returns 409 on a duplicate email**, which does leak
+account existence. The production fix is to respond identically and resolve it over
+email; that needs email infrastructure this project doesn't have.
+
+**Two-layer duplicate protection, twice**
+Both unique email and unique `content_sha256` use a Python pre-check for a readable
+error *plus* an `IntegrityError` catch for the race between check and insert. The
+database constraint is what guarantees correctness; the Python check is for UX.
+`db.rollback()` before re-raising — after an `IntegrityError` Postgres rejects every
+further statement on that connection until the transaction is rolled back.
+
+**Layer boundaries held**
+`core` and `services` raise our own exceptions (`TokenError`, `InvalidCredentials`,
+`DuplicateDocument`) and know nothing about HTTP. `api` is the only layer that
+converts them to status codes. Every service was tested directly from a Python
+script with no web server involved.
+
+**`Annotated` dependency aliases over `= Depends(...)`**
+`admin: AdminUser` puts the security requirement in the signature where a reviewer
+sees it, instead of in the function body where it can be deleted by accident.
+
+**202 Accepted for upload, not 201**
+201 would claim the document is ready; chunking hasn't started when the response is
+sent. 202 + a `status` field + `GET /documents/{id}` is the polling contract.
+
+**`BackgroundTasks`, not Celery**
+One admin, a handful of uploads, 14-day scope. Built the queue-shaped contract anyway
+— status column, immediate ID return, polling endpoint — so swapping in a real queue
+later changes the executor, not the API. Accepted limits: no retry, no supervision,
+work lost on process death, shares the API process.
+Mitigation: `ingest_document` catches every exception, writes `status = failed` and
+stores the reason in `error_message`, which `DocumentRead` exposes.
+
+**Background tasks take IDs, not ORM objects**
+The request's session is closed by the time the task runs, so `ingest_document(uuid)`
+opens its own `SessionLocal()` and closes it in `finally`. Passing the `Document`
+object would raise on every attribute access; forgetting the `finally` would leak a
+connection per upload until the pool is exhausted.
+
+**`tiktoken` `cl100k_base` for chunk sizing**
+Not the exact tokenizer for Groq or Gemini, so counts are approximate — acceptable
+for sizing chunks. For real cost tracking (Day 11), use the token counts the provider
+returns in its response rather than a local estimate.
+
+**Fixed-size chunks, not structure-aware**
+Splitting purely on token count ignores paragraph and section boundaries. The next
+improvement is splitting on structure first and falling back to hard cuts. Out of
+scope for 14 days; chunk size gets tuned against the eval set on Day 7.
+
+**Content-type validation is a convenience, not a control**
+`content_type` is client-supplied and trivially forged. What actually rejects a
+binary is the UTF-8 decode. The 5MB cap also runs *after* `await file.read()`, so
+a hostile client could still pressure memory — the real fix is a body-size limit at
+the reverse proxy. Day 12.
+
+**Sync SQLAlchemy inside `async def upload_document`**
+Blocking DB calls on the event loop. Brief enough not to matter at this scale; the
+correct fix is `asyncpg` + `AsyncSession` throughout, which is a day-one decision
+rather than a retrofit.
+
+### Numbers
+
+| Metric | Value |
+|---|---|
+| bcrypt cost factor | 12 |
+| bcrypt hash time (this machine) | 0.36 s |
+| Login — wrong password | 0.362 s |
+| Login — unknown email | 0.356 s (6 ms gap; enumeration defence holding) |
+| JWT expiry | 60 min |
+| Chunk size / overlap | 500 / 50 tokens (step 450) |
+| Chunking test: 2001 tokens | 5 chunks, last one 201 tokens |
+| policy.txt ingestion | 4 chunks, pending → ready |
+| Upload size cap | 5 MB |
+
+### API surface after Day 2
+
+| Method | Path | Auth | Success |
+|---|---|---|---|
+| GET | `/health` | none | 200 |
+| POST | `/auth/register` | none | 201 |
+| POST | `/auth/login` | none | 200 |
+| GET | `/auth/me` | any user | 200 |
+| POST | `/documents` | admin | 202 |
+| GET | `/documents/{id}` | admin | 200 |
+
+Verified: `/auth/me` 401 before login, 200 after · duplicate upload 409 ·
+agent uploading 403 · tampered token 401
+
+### Files and what's in them
+
+- `app/core/config.py` — `Settings`, `get_settings()` (`@lru_cache`)
+- `app/core/security.py` — `hash_password`, `verify_password`,
+  `create_access_token`, `decode_access_token`, `TokenError`
+- `app/db/session.py` — `engine`, `SessionLocal`, `get_db`
+- `app/models/` — `User` + `UserRole`, `Document` + `DocumentStatus`, `Chunk`,
+  `Ticket`, `TicketCitation`
+- `app/schemas/user.py` — `UserRegister`, `UserRead`, `Token`
+- `app/schemas/document.py` — `DocumentRead`
+- `app/services/auth.py` — `create_user`, `authenticate_user`, `get_user_by_email`
+- `app/services/chunking.py` — `chunk_text`, `count_tokens`, `TextChunk`
+- `app/services/documents.py` — `create_document`, `ingest_document`
+- `app/api/deps.py` — `DbSession`, `CurrentUser`, `AdminUser`, `get_current_user`,
+  `require_admin`
+- `app/api/auth.py`, `app/api/documents.py`, `app/api/health.py` — routers
+- `app/main.py` — mounts health, auth, documents routers
+
+### Open items
+
+- `get_document` in `app/api/documents.py` has imports inside the function body —
+  move them to module level
+- No `GET /documents` list endpoint yet; only fetch-by-id
+- No admin-creation path — admins are promoted with SQL. Fine for now; a seed
+  script or an admin-only `PATCH /users/{id}/role` would be the real fix
+- `app/db/session.py` calls `get_settings()` at module level, which bypasses the
+  dependency-override hook. Will need addressing for Day 5 tests
+- Day 3: pgvector extension, `embedding` column on `Chunk`, embeddings during
+  ingestion, similarity search, grounded prompt — then break it on purpose and
+  record the hallucination
