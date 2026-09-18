@@ -5,8 +5,9 @@ import time
 from app.db.session import SessionLocal
 from app.services.llm import draft_answer
 from app.services.retrieval import search_chunks
+import sys
 
-QUESTION ="What error code do I get for an expired card, and how do I update my card details?"
+QUESTION = sys.argv[1] if len(sys.argv) > 1 else "How long do I have to request a refund on my subscription?"
 
 
 def main() -> None:
