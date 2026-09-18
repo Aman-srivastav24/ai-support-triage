@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
+from app.services.embeddings import EmbeddingError, embed_text
 from app.services.chunking import chunk_text
 
 logger = logging.getLogger(__name__)
@@ -87,15 +88,23 @@ def ingest_document(document_id: uuid.UUID) -> None:
             if not chunks:
                 raise ValueError("document produced no chunks")
 
-            db.add_all(
-                Chunk(
-                    document_id=document.id,
-                    chunk_index=c.index,
-                    content=c.content,
-                    token_count=c.token_count,
+            for c in chunks:
+                embedding = embed_text(c.content, task_type="RETRIEVAL_DOCUMENT")
+                db.add(
+                    Chunk(
+                        document_id=document.id,
+                        chunk_index=c.index,
+                        content=c.content,
+                        token_count=c.token_count,
+                        embedding=embedding,
+                    )
                 )
-                for c in chunks
-            )
+                logger.info(
+                    "ingest: embedded chunk %d/%d for document %s",
+                    c.index + 1,
+                    len(chunks),
+                    document_id,
+                )
             document.chunk_count = len(chunks)
             document.status = DocumentStatus.READY
             document.error_message = None

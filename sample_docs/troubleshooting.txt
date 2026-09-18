@@ -1,0 +1,19 @@
+Troubleshooting Common Issues
+
+Login problems
+If you cannot sign in, first confirm the email address matches the one on the account. Password reset links are valid for 60 minutes and can only be used once. Error code AUTH-401 means the password was incorrect. Error code AUTH-423 means the account is locked after five failed attempts; locks clear automatically after 15 minutes. Error code AUTH-403 means the account has been suspended by an administrator.
+
+Two-factor authentication
+Two-factor authentication uses a time-based code from an authenticator app. SMS codes are not supported. If you lose access to your authenticator, use one of the ten recovery codes issued at setup. Each recovery code works once. If all recovery codes are used and the authenticator is lost, the account owner must contact support@example.com from the registered email address to begin identity verification, which takes 2 to 3 business days.
+
+Sync and data issues
+The desktop client syncs every 5 minutes by default. If changes are not appearing, check the sync status indicator in the bottom left. Error code SYN-500 indicates a server-side sync failure and usually resolves within an hour. Error code SYN-409 indicates a conflict where the same record was edited in two places; the client keeps both versions and marks the newer one as primary.
+
+Performance
+Workspaces with more than 50,000 records may load slowly on first open. Clearing the local cache from Settings under Advanced often helps. The web client requires a browser released within the last two years. Internet Explorer is not supported.
+
+File uploads
+The maximum file size is 25 MB per file. Supported formats are PDF, PNG, JPG, CSV and TXT. Uploads fail with error code FILE-413 when the file is too large and FILE-415 when the format is not supported. Files are scanned for malware before becoming available, which usually takes under a minute.
+
+Notifications
+Email notifications are sent within 5 minutes of an event. If they are missing, check the spam folder and confirm notifications are enabled in Settings under Notifications. Push notifications require the mobile app version 4.2 or later.

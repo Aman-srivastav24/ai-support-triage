@@ -1,0 +1,19 @@
+Billing and Payments
+
+Subscription plans
+We offer three plans: Starter at $12 per month, Team at $49 per month, and Business at $199 per month. All plans are billed monthly in advance. Annual billing is available on Team and Business plans at a 20 percent discount.
+
+Payment methods
+We accept Visa, Mastercard and American Express. We do not accept PayPal, bank transfer, or cryptocurrency. Cards are charged on the same calendar day each month. If that day does not exist in a given month, the charge falls on the last day of that month.
+
+Failed payments
+If a payment fails, we retry three times over seven days. Your account stays active during this period. After the third failed attempt the account is suspended, and data is retained for 30 days before deletion. Error code BIL-402 means the card was declined by the issuing bank. Error code BIL-409 means the card has expired.
+
+Refunds
+Refunds are available within 14 days of the first charge on a new subscription. Renewal charges are not refundable. To request a refund, contact billing@example.com with your account email and invoice number. Refunds are returned to the original payment method and take 5 to 10 business days to appear.
+
+Changing plans
+Upgrades take effect immediately and are charged pro rata. Downgrades take effect at the start of the next billing cycle. Cancelling stops future charges but does not refund the current period, and access continues until the period ends.
+
+Invoices
+Invoices are emailed to the account owner on the day of charge. Past invoices can be downloaded from Settings under Billing History for the last 24 months. VAT is added for customers in the EU and UK where applicable.

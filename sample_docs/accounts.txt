@@ -1,0 +1,19 @@
+Accounts, Access and Delivery
+
+User roles
+Every workspace has one owner and can have any number of admins and members. Owners can transfer ownership, delete the workspace and manage billing. Admins can invite and remove users and change workspace settings, but cannot access billing. Members can create and edit records but cannot change settings. There is no read-only role.
+
+Inviting users
+Invitations are sent by email and expire after 7 days. An expired invitation must be resent; it cannot be extended. Users on the Starter plan are limited to 3 seats. Team allows 25 seats and Business is unlimited. Adding a seat mid-cycle is charged pro rata.
+
+Removing users
+When a user is removed, their records remain in the workspace and are reassigned to the workspace owner. Removed users lose access immediately. A removed user can be re-invited later, but their previous settings and saved views are not restored.
+
+Account deletion
+Deleting a workspace is permanent and takes effect after a 14 day grace period, during which it can be restored by the owner. After 14 days all data is erased and cannot be recovered. Individual user accounts can be deleted from Settings under Profile; this removes the user from all workspaces they belong to.
+
+Physical deliveries
+Hardware orders ship from our warehouse in Rotterdam. Standard delivery within the EU takes 3 to 5 business days and costs 9 euros. Express delivery takes 1 to 2 business days and costs 24 euros. We ship to the UK, Switzerland and Norway, where customs charges are paid by the recipient. We do not ship to the United States, Canada or Asia.
+
+Returns of hardware
+Hardware can be returned within 30 days of delivery if unopened. Opened hardware can only be returned if faulty. Return shipping is paid by the customer unless the item is faulty. Contact hardware@example.com to receive a return authorisation number before shipping anything back; returns without this number are refused.

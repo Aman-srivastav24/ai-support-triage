@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     gemini_api_key: str
     gemini_embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 768
+        # --- Groq (generation) ---
+    groq_api_key: str
+    groq_model: str = "openai/gpt-oss-20b"
 
 
 @lru_cache
