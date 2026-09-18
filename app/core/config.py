@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     jwt_secret_key: str
     jwt_algorithm: str = "HS256"
     jwt_expiry_minutes: int = 60
+        # --- Gemini (embeddings) ---
+    gemini_api_key: str
+    gemini_embedding_model: str = "gemini-embedding-001"
+    embedding_dimensions: int = 768
 
 
 @lru_cache

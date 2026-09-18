@@ -35,6 +35,7 @@ services:
       REDIS_URL: redis://redis:6379/0
       ENVIRONMENT: development
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY is not set}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:?GEMINI_API_KEY is not set}
     volumes:
       - ./app:/code/app
     depends_on:
