@@ -381,3 +381,220 @@ agent uploading 403 · tampered token 401
 - Day 3: pgvector extension, `embedding` column on `Chunk`, embeddings during
   ingestion, similarity search, grounded prompt — then break it on purpose and
   record the hallucination
+
+  ## Day 3 — RAG core
+
+**Date:** 18 Sep 2026
+
+### Built
+
+- `app/services/embeddings.py` — Gemini `embedContent` via httpx, `EmbeddingError`,
+  30s timeout, dimension assertion, L2 normalisation. Only module knowing the
+  embedding provider.
+- Migration `a2cc4598a7c9` — `CREATE EXTENSION IF NOT EXISTS vector`, nullable
+  `embedding vector(768)` on `chunks`, HNSW index with `vector_cosine_ops`
+- `Chunk.embedding` via `pgvector.sqlalchemy.Vector(768)`
+- `ingest_document` now embeds each chunk before insert, logs per-chunk progress,
+  single commit at the end so a partial failure leaves nothing behind
+- `scripts/backfill_embeddings.py` — idempotent NULL-only backfill, commits every
+  10 rows, skips individual failures. Written but never needed; test data was
+  deleted instead.
+- `app/services/retrieval.py` — `search_chunks`, cosine distance via `<=>`,
+  returns frozen `RetrievedChunk` with similarity = 1 - distance
+- `app/services/llm.py` — Groq chat completions, `LLMError`, 60s timeout,
+  temperature 0.2, grounded system prompt
+- `app/services/tickets.py` — `create_ticket` (commit immediately) and
+  `process_ticket` (retrieve → filter → draft → store citations)
+- `app/schemas/ticket.py` — `TicketCreate`, `CitationRead`, `TicketRead`
+- `app/api/tickets.py` — `POST /tickets`, public, 201
+- `sample_docs/` — billing, troubleshooting, accounts. Written to contain
+  specific numbers, error codes, deliberate gaps, and a 14-day vs 30-day
+  refund collision.
+- `scripts/test_embeddings.py`, `test_retrieval.py`, `test_llm.py`
+
+### What broke
+
+**1. Gemini vectors are not unit length at reduced dimensions**
+Magnitude came back 0.5898, not 1.0. Gemini normalises its default 3072-dim
+output; truncating to 768 via `outputDimensionality` does not renormalise.
+Caught by measuring instead of assuming. Fixed with `_normalise` in the service
+so every stored vector is unit length. Similarity scores were identical to four
+decimal places before and after — normalising changes length, not direction.
+Matters because cosine-equals-dot-product only holds for unit vectors, and half
+the reference material assumes it.
+
+**2. Alembic autogenerate produced a file that could not run**
+It detected the column but wrote `pgvector.sqlalchemy.vector.VECTOR(dim=768)`
+with no corresponding import — `NameError` on apply. It also cannot see
+extensions or vector indexes at all. Rewrote `upgrade()` by hand.
+Autogenerate is a draft, not an answer.
+
+**3. `httpx` was a dev-only dependency**
+Declared under `[project.optional-dependencies] dev` because it arrived with
+FastAPI's TestClient. Application code now imports it at runtime, so it had to
+move to the main list. Caught before it reached the container — the same class
+of failure as Day 2's `tiktoken`.
+
+**4. Groq model `llama-3.3-70b-versatile` returned 404**
+Model retired. 404 not 401 is the tell: the key authenticated, the path didn't
+resolve. Listed available models via `GET /openai/v1/models` and switched to
+`openai/gpt-oss-20b`. One-line change because the model name lives in config,
+not in `llm.py`.
+
+**5. Test corpus was one paragraph repeated**
+`policy.txt` and `refunds.txt` were the same refund sentence copy-pasted to
+length — 8 chunks, all near-identical embeddings, retrieval untestable. Also
+revealed SHA-256 dedup is exact-match only; the two files differed by a byte.
+Deleted both; `ON DELETE CASCADE` removed the chunks automatically.
+
+**6. Shell word-splitting in `test_llm.py`**
+`python scripts/test_llm.py please tell me about refund policy` passed only
+`please` — the shell split on spaces and `sys.argv[1]` is one word.
+Fixed with `" ".join(sys.argv[1:])`.
+
+### The hallucination (Day 3's required experiment)
+
+Question: *"Do you offer a student discount, and how do I apply for it?"*
+Retrieval: Billing at 0.5756. No student discount exists anywhere in the corpus.
+
+**Naive prompt** ("You are a helpful customer support assistant"):
+
+> I'm afraid we don't have a dedicated student discount at the moment. All of our
+> plans are priced as listed (Starter $12 / month, Team $49 / month, Business
+> $199 / month) with the 20 % annual-billing discount available on the Team and
+> Business tiers.
+>
+> If you believe you might qualify for a special rate or have a unique situation,
+> you can reach out to our billing team at billing@example.com. They'll review
+> your request and let you know if any additional discounts can be applied.
+
+Prices, the annual discount and the email address are all correct. The invented
+part is the **process**: the corpus says `billing@` is for refund requests with an
+invoice number. There is no discount review. "at the moment" also implies a
+roadmap it has no knowledge of.
+
+The dangerous failure was not a fabricated fact but a fabricated process appended
+to an otherwise accurate answer — which survives a skim review, unlike an obviously
+wrong number.
+
+**Grounded prompt**, same question, same chunks, same model:
+
+> The documentation does not cover this.
+
+Verified grounding did not overcorrect:
+
+| Case | Result |
+|---|---|
+| Fully answerable (refund window) | "within 14 days of the first charge… renewal charges are not refundable" |
+| Not answerable (student discount) | exact refusal sentence |
+| Partially answerable (BIL-409 + how to update card) | gave the code, stated the rest is not covered |
+
+The grounded answer to the refund question was also *tighter* than the naive one,
+which had added an inference the document does not make.
+
+### Decisions
+
+**Gemini for embeddings, Groq for generation**
+Groq has no embeddings endpoint, so a second provider was unavoidable (flagged as
+a Day 0 open item). Alternative considered: `sentence-transformers` locally — no
+API dependency, works offline, but pulls PyTorch (~2 GB) into the image, which is
+a bad trade on Day 5 deployment and Render's free tier. Rejected on image size.
+Accepted cost: ingestion and the ticket path both depend on an external service.
+
+**768 dimensions, not the default 3072**
+pgvector's HNSW index caps at 2000 dimensions, so 3072 could not be indexed on a
+`vector` column. 768 is one of Google's recommended MRL sizes and stores at ~3 KB
+per chunk instead of ~12 KB.
+
+**HNSW, not IVFFlat**
+HNSW builds on an empty table and gives better recall; IVFFlat needs
+representative data present before the index is built. Chunks arrive over time,
+so IVFFlat would have to be rebuilt.
+
+**`vector_cosine_ops` is a contract, not a detail**
+The index is only used if queries use the matching operator. Querying with L2
+would silently seq-scan with no error.
+
+**Nullable column, then backfill**
+Standard three-step for adding a column to a populated table: add nullable,
+backfill, optionally tighten. `NOT NULL` would have required inventing a vector
+for existing rows, and a zero vector is a lie that poisons search.
+
+**No `DROP EXTENSION` in downgrade**
+Extensions are database-wide shared state. Another table may depend on it by then.
+
+**Single commit in ingestion, periodic commits in backfill**
+Opposite rules for opposite goals. A half-ingested document is a broken state —
+searches find some of it and silently miss the rest — so it is all-or-nothing.
+A half-completed backfill is genuine progress, and the NULL filter makes a
+restart resume cleanly.
+
+**`SIMILARITY_FLOOR = 0.55` is a junk filter, not a correctness check**
+Set just above the unrelated-question ceiling of 0.525. It cannot separate
+answerable from unanswerable because those bands overlap (below). Grounding and
+human review do that job.
+
+**`customer_email` is `str`, not `EmailStr`**
+A typo in an email should not block a support ticket from reaching a human.
+Contrast `UserRegister`, where the email is the login identity and strictness is
+correct. Validate strictly where wrong data breaks something.
+
+**201 on `/tickets`, 202 on `/documents`**
+Processing completes before the ticket response is sent, so the resource exists
+in full. If Day 4 backgrounds it, this becomes 202 plus a polling endpoint —
+the contract uploads already use.
+
+**502 for LLM failure, 500 for everything else**
+502 means the dependency failed, not the service, and suggests a retry may help.
+Both messages state the ticket *was* received, which is true: `create_ticket`
+commits before processing.
+
+### Numbers
+
+| Metric | Value |
+|---|---|
+| Embedding model / dimensions | `gemini-embedding-001` / 768 |
+| Vector magnitude before / after normalisation | 0.5898 / 1.000000 |
+| Embedding latency (single call) | 0.6 – 1.9 s, ~1.1 s typical |
+| Retrieval latency, median | ~0.7 s, dominated by the embedding call |
+| Generation latency (`openai/gpt-oss-20b`) | 0.65 – 1.95 s, ~0.8 s typical |
+| End-to-end, retrieve + draft | ~1.5 s |
+| **Top-1 retrieval accuracy, in-corpus** | **5 / 5** |
+| In-corpus top-score range | 0.587 – 0.656 |
+| Not-in-corpus top-score range | 0.586 – 0.605 |
+| Unrelated top-score range | 0.515 – 0.525 |
+| Similarity floor chosen | 0.55 |
+| Documents / chunks | 3 / 3 |
+
+**The finding that matters most:** the in-corpus and not-in-corpus bands overlap.
+The worst legitimate question ("How long does delivery to the UK take?", 0.5865)
+scored *lower* than two questions the corpus cannot answer — student discount
+0.5965 and phone number 0.6053. The single word "please" scored 0.6093.
+No threshold separates answerable from unanswerable. Similarity measures topic,
+not whether a specific fact is present. This is why a threshold alone is not
+grounding, and why the design needs the grounded prompt, citations and a human
+reviewer as well.
+
+### API surface after Day 3
+
+| Method | Path | Auth | Success |
+|---|---|---|---|
+| POST | `/tickets` | none (public) | 201 |
+
+### Open items
+
+- **`POST /tickets` has not been called yet** — code compiles and the container is
+  healthy, nothing more. Verify before claiming it works.
+- Each sample document produces exactly 1 chunk (all under 500 tokens), so chunk
+  overlap and mid-sentence cuts are not exercised, and "right chunk" is the same
+  problem as "right document". Expand the corpus on Day 7.
+- Ingestion embeds chunks serially with no retry and holds one transaction open
+  for the whole run. Batching or concurrency is the obvious improvement.
+- `POST /tickets` blocks ~1.5 s on two external calls, with sync SQLAlchemy on
+  the event loop. Public and unrate-limited until Day 12.
+- `used_in_reply` on `TicketCitation` is always false — retrieved is not the same
+  as used. Day 10 reflection fills this in.
+- `confidence` stays NULL and no ticket reaches `escalated`. Day 4.
+- Groq retired a model mid-project; model name stays in config for this reason.
+- Carried from Day 2: imports inside `get_document`; no `GET /documents` list;
+  `session.py` calls `get_settings()` at module level.
