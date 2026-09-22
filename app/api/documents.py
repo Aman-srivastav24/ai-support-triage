@@ -24,7 +24,6 @@ from app.services.documents import (
 )
 
 router = APIRouter(prefix="/documents", tags=["documents"])
-
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_CONTENT_TYPES = {"text/plain", "text/markdown", "application/octet-stream"}
 

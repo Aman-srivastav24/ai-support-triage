@@ -4,9 +4,9 @@ from app.api.auth import router as auth_router
 from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.api.documents import router as documents_router
-from app.api import tickets
+from app.api.tickets import router as tickets_router
 
-settings = get_settings()
+settings = get_settings() #importing from app.core.config
 
 app = FastAPI(
     title=settings.app_name,
@@ -17,4 +17,4 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(auth_router)
 app.include_router(documents_router)
-app.include_router(tickets.router)
+app.include_router(tickets_router)
