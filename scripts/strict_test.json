@@ -1,0 +1,22 @@
+{
+  "model": "openai/gpt-oss-20b",
+  "messages": [
+    {"role": "system", "content": "Classify the support ticket into one category."},
+    {"role": "user", "content": "I was charged twice this month, can I get one back?"}
+  ],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "ticket_classification",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {
+          "category": {"type": "string", "enum": ["billing", "technical", "account", "other"]}
+        },
+        "required": ["category"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
