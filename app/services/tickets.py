@@ -1,4 +1,4 @@
-"""Ticket intake and draft generation. Knows nothing about HTTP."""
+"""Ticket intake and triage. Knows nothing about HTTP."""
 
 from __future__ import annotations
 
@@ -8,15 +8,12 @@ from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
+from app.graph.triage import build_triage_graph
 from app.models.ticket import Ticket, TicketStatus
 from app.models.ticket_citation import TicketCitation
-from app.services.llm import draft_answer
-from app.services.retrieval import RetrievedChunk, search_chunks
+from app.services.retrieval import RetrievedChunk
 
 logger = logging.getLogger(__name__)
-
-SIMILARITY_FLOOR = 0.55
-TOP_K = 3
 
 
 def create_ticket(
@@ -40,7 +37,12 @@ def create_ticket(
 
 
 def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
-    """Retrieve context, draft a reply, and store citations."""
+    """Run the ticket through the triage graph and persist the outcome.
+
+    The graph decides; this function owns the database. Keeping every write
+    here means one transaction to reason about and one place that knows how
+    a graph result maps onto a row.
+    """
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
         raise ValueError(f"ticket {ticket_id} not found")
@@ -49,21 +51,24 @@ def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
     db.commit()
 
     try:
-        query = f"{ticket.subject}\n{ticket.body}" if ticket.subject else ticket.body
-        hits = search_chunks(db, query, top_k=TOP_K)
-        usable = [hit for hit in hits if hit.similarity >= SIMILARITY_FLOOR]
+        graph = build_triage_graph(db)
+        result = graph.invoke(
+            {
+                "ticket_id": ticket.id,
+                "subject": ticket.subject,
+                "body": ticket.body,
+            }
+        )
 
-        if not usable:
-            ticket.draft_reply = None
-            ticket.status = TicketStatus.DRAFTED
-            ticket.escalation_reason = (
-                f"no chunk above similarity floor {SIMILARITY_FLOOR}"
-            )
-            logger.info("ticket %s: nothing above floor, no draft", ticket_id)
-        else:
-            ticket.draft_reply = draft_answer(query, [hit.content for hit in usable])
-            ticket.status = TicketStatus.DRAFTED
-            _store_citations(db, ticket, usable)
+        ticket.category = result["category"]
+        ticket.draft_reply = result["draft"]
+        ticket.confidence = result["confidence"]
+        ticket.escalation_reason = result["escalation_reason"]
+        ticket.status = (
+            TicketStatus.ESCALATED if result["escalate"] else TicketStatus.DRAFTED
+        )
+
+        _store_citations(db, ticket, result["chunks"])
 
         ticket.processed_at = datetime.now(timezone.utc)
         db.commit()
@@ -72,10 +77,13 @@ def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
 
     except Exception as exc:
         db.rollback()
-        ticket.status = TicketStatus.FAILED
-        ticket.escalation_reason = str(exc)[:1000]
-        ticket.processed_at = datetime.now(timezone.utc)
-        db.commit()
+        # Re-fetch: after a rollback the object above may be stale or detached.
+        ticket = db.get(Ticket, ticket_id)
+        if ticket is not None:
+            ticket.status = TicketStatus.FAILED
+            ticket.escalation_reason = str(exc)[:1000]
+            ticket.processed_at = datetime.now(timezone.utc)
+            db.commit()
         logger.exception("ticket %s: processing failed", ticket_id)
         raise
 
@@ -83,7 +91,11 @@ def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
 def _store_citations(
     db: Session, ticket: Ticket, hits: list[RetrievedChunk]
 ) -> None:
-    """Record which chunks informed the draft, in rank order."""
+    """Record which chunks informed the draft, in rank order.
+
+    `used_in_reply` stays false: retrieved is not the same as used. The
+    Day 10 reflection node is what can tell the difference.
+    """
     for rank, hit in enumerate(hits, start=1):
         db.add(
             TicketCitation(

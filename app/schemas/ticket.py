@@ -1,4 +1,4 @@
-"""Request and response shapes for the public ticket endpoint."""
+"""Request and response shapes for ticket endpoints."""
 
 import uuid
 
@@ -13,6 +13,20 @@ class TicketCreate(BaseModel):
     customer_email: str = Field(max_length=320)
 
 
+class TicketAck(BaseModel):
+    """What the PUBLIC endpoint returns: a receipt, nothing more.
+
+    The draft is written for a support agent to review, so it must not
+    reach the customer — a draft the customer has already read is not a
+    draft. Citations, scores and categories are internal: exposing them
+    would let an anonymous caller map the corpus by probing with crafted
+    questions and reading the similarity back.
+    """
+
+    id: uuid.UUID
+    status: str
+
+
 class CitationRead(BaseModel):
     """One chunk that informed the draft answer."""
 
@@ -23,9 +37,12 @@ class CitationRead(BaseModel):
 
 
 class TicketRead(BaseModel):
-    """What the caller gets back."""
+    """Full triage result. AGENT-FACING — never returned to a public caller."""
 
     id: uuid.UUID
     status: str
+    category: str | None
     draft_reply: str | None
+    confidence: float | None
+    escalation_reason: str | None
     citations: list[CitationRead]

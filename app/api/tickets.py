@@ -1,20 +1,32 @@
 """Public ticket submission endpoint."""
 
-from fastapi import APIRouter, HTTPException, status
+import logging
+
+from fastapi import APIRouter, status
 
 from app.api.deps import DbSession
-from app.schemas.ticket import CitationRead, TicketCreate, TicketRead
-from app.services.llm import LLMError
+from app.schemas.ticket import TicketAck, TicketCreate
+
 from app.services.tickets import create_ticket, process_ticket
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
-@router.post("", response_model=TicketRead, status_code=status.HTTP_201_CREATED)
-def submit_ticket(payload: TicketCreate, db: DbSession) -> TicketRead:
-    """Accept a customer ticket, draft a grounded reply, return it with citations.
+@router.post("", response_model=TicketAck, status_code=status.HTTP_201_CREATED)
+def submit_ticket(payload: TicketCreate, db: DbSession) -> TicketAck:
+    """Accept a customer ticket and triage it.
 
     Public: no authentication. Rate limiting is Day 12.
+
+    Returns a receipt only. The draft is written for a support agent to
+    review and is fetched from the agent-facing endpoint, not returned
+    here — an unreviewed draft in the customer's hands is not a draft.
+
+    Triage failure is not reported to the caller: the ticket was stored
+    and a human will see it either way. Telling the customer it failed
+    invites a resubmission of a ticket that already exists.
     """
     ticket = create_ticket(
         db,
@@ -25,28 +37,9 @@ def submit_ticket(payload: TicketCreate, db: DbSession) -> TicketRead:
 
     try:
         ticket = process_ticket(db, ticket.id)
-    except LLMError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Ticket received but the draft could not be generated.",
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Ticket received but processing failed.",
-        ) from exc
+    except Exception:
+        # process_ticket has already marked the ticket FAILED and logged
+        # the traceback. The receipt below is still accurate.
+        logger.warning("ticket %s: triage failed, acknowledging anyway", ticket.id)
 
-    return TicketRead(
-        id=ticket.id,
-        status=ticket.status,
-        draft_reply=ticket.draft_reply,
-        citations=[
-            CitationRead(
-                chunk_id=c.chunk_id,
-                document_id=c.chunk.document_id,
-                document_title=c.chunk.document.title,
-                similarity=c.score,
-            )
-            for c in ticket.citations
-        ],
-    )
+    return TicketAck(id=ticket.id, status=ticket.status)
