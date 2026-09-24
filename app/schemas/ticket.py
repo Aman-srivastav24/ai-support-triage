@@ -1,6 +1,7 @@
 """Request and response shapes for ticket endpoints."""
 
 import uuid
+from datetime import datetime  # ← CHANGE
 
 from pydantic import BaseModel, Field
 
@@ -37,10 +38,20 @@ class CitationRead(BaseModel):
 
 
 class TicketRead(BaseModel):
-    """Full triage result. AGENT-FACING — never returned to a public caller."""
+    """Full triage result. AGENT-FACING — never returned to a public caller.
+
+    Includes the original question and the customer's address: an agent
+    cannot review a draft without seeing what was asked, or reply without
+    knowing who asked. That makes this personal data, which is why the
+    endpoint serving it requires authentication.
+    """
 
     id: uuid.UUID
     status: str
+    subject: str | None  # ← CHANGE
+    body: str  # ← CHANGE
+    customer_email: str  # ← CHANGE
+    created_at: datetime  # ← CHANGE
     category: str | None
     draft_reply: str | None
     confidence: float | None

@@ -12,7 +12,7 @@ import uuid
 from sqlalchemy import text
 
 from app.db.session import engine
-from app.graph.nodes import REFUSAL_SENTENCE
+from app.graph.nodes import REFUSAL_SENTENCE, SIMILARITY_FLOOR
 from app.schemas.classification import TicketCategory
 
 DOC_TEXT = (
@@ -131,3 +131,36 @@ def test_no_relevant_chunks_escalates_without_asking_the_model_to_draft(
     # API call with no context, so the model is never asked to draft.
     assert fake_llm.draft_calls == []
     assert "no chunks above the similarity floor" in stored(receipt["id"])["escalation_reason"]
+
+def test_an_agent_can_read_the_full_triage_result(
+    client, admin_headers, agent_headers, fake_llm
+):
+    add_document(client, admin_headers)
+    receipt = submit(client, ANSWERABLE)
+
+    # An agent, not an admin: reading the queue is every staff member's job.
+    response = client.get(f"/tickets/{receipt['id']}", headers=agent_headers)
+
+    assert response.status_code == 200
+    ticket = response.json()
+    assert ticket["status"] == "drafted"
+    assert ticket["body"] == ANSWERABLE["body"]
+    assert ticket["customer_email"] == ANSWERABLE["customer_email"]
+    assert ticket["draft_reply"] == fake_llm.reply
+    # One document uploaded, one chunk: exactly one citation, joined to its title.
+    assert [c["document_title"] for c in ticket["citations"]] == ["Refund policy"]
+    assert ticket["citations"][0]["similarity"] >= SIMILARITY_FLOOR
+
+
+def test_reading_a_ticket_requires_a_token(client):
+    receipt = submit(client, UNRELATED)
+
+    response = client.get(f"/tickets/{receipt['id']}")
+
+    assert response.status_code == 401
+
+
+def test_reading_an_unknown_ticket_is_a_404(client, agent_headers):
+    response = client.get(f"/tickets/{uuid.uuid4()}", headers=agent_headers)
+
+    assert response.status_code == 404

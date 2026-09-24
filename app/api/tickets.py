@@ -1,17 +1,31 @@
 """Public ticket submission endpoints."""
 
+"""Ticket endpoints.
+
+Submission (POST /tickets, POST /tickets/stream) is public and returns a
+receipt only. Reading the full triage result (GET /tickets/{id}) requires
+login: it carries the draft, similarity scores and the customer's email.
+"""
+
 import json
 import logging
+import uuid
 from collections.abc import Iterator
 
-from fastapi import APIRouter, status
+from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import DbSession, EmbeddingProvider, LLMProvider  # ← CHANGE
+from app.api.deps import CurrentUser, DbSession, EmbeddingProvider, LLMProvider
 from app.graph.triage import build_triage_graph
 from app.models.ticket import TicketStatus
-from app.schemas.ticket import TicketAck, TicketCreate
-from app.services.tickets import create_ticket, mark_failed, persist_result, process_ticket
+from app.schemas.ticket import CitationRead, TicketAck, TicketCreate, TicketRead
+from app.services.tickets import (
+    create_ticket,
+    get_ticket_with_citations,
+    mark_failed,
+    persist_result,
+    process_ticket,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +152,42 @@ def submit_ticket_streaming(
             yield _sse({"stage": "error", "id": str(ticket.id)})
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
+@router.get("/{ticket_id}", response_model=TicketRead)
+def get_ticket(ticket_id: uuid.UUID, user: CurrentUser, db: DbSession) -> TicketRead:
+    """Full triage result for support staff. Requires login.
+
+    Any authenticated user may read any ticket: every account is staff
+    (agent or admin), and triaging the whole queue is their job, so there
+    is no per-ticket ownership to check. If customer accounts are ever
+    added, this needs an ownership check — without one, a customer could
+    read other customers' tickets by changing the ID in the URL (IDOR,
+    OWASP API #1: broken object level authorization).
+    """
+    found = get_ticket_with_citations(db, ticket_id)
+    if found is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Ticket not found"
+        )
+
+    ticket, citations = found
+    return TicketRead(
+        id=ticket.id,
+        status=ticket.status,
+        subject=ticket.subject,
+        body=ticket.body,
+        customer_email=ticket.customer_email,
+        created_at=ticket.created_at,
+        category=ticket.category,
+        draft_reply=ticket.draft_reply,
+        confidence=ticket.confidence,
+        escalation_reason=ticket.escalation_reason,
+        citations=[
+            CitationRead(
+                chunk_id=c.chunk_id,
+                document_id=c.document_id,
+                document_title=c.document_title,
+                similarity=c.similarity,
+            )
+            for c in citations
+        ],
+    )

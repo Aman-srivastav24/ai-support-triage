@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.graph.triage import build_triage_graph
+from app.models.chunk import Chunk
+from app.models.document import Document
 from app.models.ticket import Ticket, TicketStatus
 from app.models.ticket_citation import TicketCitation
-from app.services.providers import Embedder, LLMClient  # ← CHANGE
+from app.services.providers import Embedder, LLMClient
 from app.services.retrieval import RetrievedChunk
-
 logger = logging.getLogger(__name__)
 
 
@@ -130,3 +133,51 @@ def _store_citations(
                 score=hit.similarity,
             )
         )
+@dataclass(frozen=True)
+class CitationDetail:
+    """A citation joined through to its document, ready to display."""
+
+    chunk_id: uuid.UUID
+    document_id: uuid.UUID
+    document_title: str
+    similarity: float
+
+
+def get_ticket_with_citations(
+    db: Session, ticket_id: uuid.UUID
+) -> tuple[Ticket, list[CitationDetail]] | None:
+    """Load a ticket and its citations in two queries, whatever the count.
+
+    Walking ticket.citations -> chunk -> document would lazy-load each hop
+    per citation (N+1). Eager loading would fix the count but pull whole
+    Document rows, including raw_text, the entire uploaded file, just to
+    read a title. This selects the four columns the agent view needs.
+    """
+    ticket = db.get(Ticket, ticket_id)
+    if ticket is None:
+        return None
+
+    rows = db.execute(
+        select(
+            TicketCitation.chunk_id,
+            Chunk.document_id,
+            Document.title,
+            TicketCitation.score,
+        )
+        .join(Chunk, Chunk.id == TicketCitation.chunk_id)
+        .join(Document, Document.id == Chunk.document_id)
+        .where(TicketCitation.ticket_id == ticket_id)
+        .order_by(TicketCitation.rank)
+    ).all()
+
+    citations = [
+        CitationDetail(
+            chunk_id=row.chunk_id,
+            document_id=row.document_id,
+            document_title=row.title,
+            similarity=row.score,
+        )
+        for row in rows
+    ]
+    return ticket, citations
+
