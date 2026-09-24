@@ -857,3 +857,162 @@ Stream events, in order: `received`, `classified`, `retrieved`, `drafted`,
   dependency-override hook needed for Day 5 tests.
 - No agent-facing endpoint yet. `TicketRead` exists but nothing serves it, so
   nothing can currently read a draft. Day 5.
+
+  ## Day 5 (part 1) — Testability refactor and test suite
+
+**Date:** 24 Sep 2026
+
+### Built
+
+- `app/services/providers.py` — `LLMClient` and `Embedder` Protocols, `GroqLLM`
+  and `GeminiEmbedder` as thin wrappers over the existing functions, `get_llm`
+  and `get_embedder` dependencies. No prompt, caching or error-handling logic
+  moved.
+- `LLMProvider` / `EmbeddingProvider` Annotated aliases in `app/api/deps.py`
+- Providers threaded through every layer: routes → `process_ticket` →
+  `build_triage_graph(db, *, llm, embedder)` → node factories
+  (`make_classify_node`, `make_retrieve_node`, `make_draft_node`) →
+  `search_chunks(..., embedder=)`. Upload route passes the embedder into the
+  `ingest_document` background task.
+- `get_document` imports moved to module level (Day 2 open item)
+- `scripts/test_graph.py`, `test_retrieval.py`, `test_llm.py` updated;
+  `scripts/test_ticket_flow.py` deleted (unfinished, did not parse, duplicated
+  `test_retrieval.py`)
+- `triage_test` database, schema built with `alembic upgrade head`
+- `[tool.pytest.ini_options] testpaths = ["tests"]`
+- `tests/conftest.py` — test env set before app import, safety guard,
+  `FakeEmbedder` (feature hashing), `FakeLLM` (scripted, records calls),
+  `clean_state`, `client`, `agent_headers`, `admin_headers`
+- 20 tests: fake embedder (5), health (1), auth (6), documents (4), tickets (4)
+- Commits: `fd2f7f7` refactor, `796a70f` tests
+
+### What broke
+
+**1. The plan's testing approach did not fit the code**
+"Use `dependency_overrides` to fake the LLM" — but the LLM was not a
+dependency. Nodes imported and called Groq and Gemini directly. An audit
+(grep for module-level settings, `SessionLocal(`, `from_url(`, `Depends(`)
+found five hard-wired points, not the one flagged in the Day 4 handoff:
+Groq, Gemini, the background task's own session, import-time settings in
+`session.py` and `main.py`, and a Redis client shared with dev.
+
+**2. `monkeypatch` would have been silently wrong**
+`nodes.py` did `from app.services.llm import classify_ticket`, which copies
+the reference at import. Patching `app.services.llm.classify_ticket` would
+not reach the node. Chose injection over monkeypatch for this reason.
+
+**3. The false pass, demonstrated on purpose**
+Removed the LLM override. Real client hit Groq with the dummy key → 401 →
+`classify_ticket` returned OTHER (never raises) → escalated → 201. The
+`status == "escalated"` assertion passed. `len(fake_llm.classify_calls) == 1`
+caught it. With that assertion also removed, the test passed while verifying
+nothing.
+
+**4. `InsecureKeyLengthWarning` from PyJWT**
+The test JWT secret was 30 bytes; HS256 needs at least 32. Fixed the test key,
+then checked the real one: 43 bytes, fine. Found only because warnings were
+left visible instead of muted.
+
+**5. pytest would have imported `scripts/`**
+Default discovery collects any `test_*.py`. Six scripts matched; most make
+real API calls at import and one did not parse. Fixed with `testpaths`.
+
+**6. Placeholder left in a command**
+Ran `GET /documents/PASTE_ID_HERE` → 404. Side observation: a malformed ID
+returns the same 404 as a missing one, which is correct.
+
+### Decisions
+
+**Injection over monkeypatch**
+Deciding factor: a wrong monkeypatch fails silently here, because
+classification never raises; a missed injected dependency raises `TypeError`.
+Also matches the plan and the existing `make_retrieve_node(db)` closure
+pattern. Cost ~1.5–2 h. Monkeypatch is fine for code you can't change.
+
+**`Protocol` over `ABC`**
+Structural typing: fakes need not inherit from production code. Checked by
+type checkers, not at runtime — a missing method is an `AttributeError` at
+the call site, still loud.
+
+**Clients are required keyword-only arguments with no default**
+A default of `GeminiEmbedder()` would make a forgotten argument silently call
+the real API in tests.
+
+**Only the outermost layer chooses the provider**
+Routes via `Depends`; scripts construct real providers directly (a script is
+its own outermost layer). Services and nodes only pass through.
+
+**Clients are closed over, not put in `TriageState`**
+State is data about the ticket; it is streamed, asserted on, and could be
+checkpointed. A client is a request-scoped tool and is not serialisable.
+
+**Tests isolated by environment, not by refactoring `session.py`**
+pytest loads `conftest.py` first, and env vars beat `.env` in
+pydantic-settings. So test settings are in place before the first import
+fixes them. The guard checks the *resolved* settings, not `os.environ` —
+proves what the app will use, not what was intended. Refuses unless the
+database ends in `_test` and Redis is not database 0. Tested by pointing it
+at the dev database: refused.
+
+**Real Postgres for tests, built by Alembic**
+SQLite cannot run pgvector. `create_all` would skip `CREATE EXTENSION` and
+the hand-written HNSW index. Alembic also tests the migrations.
+
+**Truncate, not transaction rollback**
+Services commit on their own, and `ingest_document` opens its own session,
+so rollback cannot undo everything a test writes. Clean *before* each test
+so a crashed test can't leave the next dirty. `FLUSHDB`, never `FLUSHALL` —
+the latter would wipe dev's database 0.
+
+**Fake embedder uses feature hashing**
+Random vectors would never clear the 0.55 floor, making the drafted path
+untestable. Bag-of-words hashing keeps "shared words → similar". `hashlib`,
+not `hash()`, which Python randomises per process. Its behaviour against the
+real `SIMILARITY_FLOOR` is itself tested.
+
+**Fakes record calls**
+Every ticket test asserts the fake was called. Without it, the false pass
+above goes undetected.
+
+**`clean_state` is not autouse**
+Pure tests (fake embedder) should not need Postgres running.
+
+**Admin created by SQL promotion in the fixture**
+Mirrors the real process; there is no admin endpoint. Asserts
+`rowcount == 1` because an UPDATE matching nothing does not error.
+
+### Numbers
+
+| Metric | Value |
+|---|---|
+| `POST /tickets` after refactor (real providers) | 2.11 s (Day 4 cold: 2.04 s) — within provider variance |
+| Regression, `test_graph.py` | identical to Day 4: 0.6572 / 0.5874 / 0.5672, same categories and escalations |
+| Regression, `test_retrieval.py` | identical to Day 3: top-1 5/5, all three score bands match |
+| Unanswerable "university student discount" | top score **0.6495**, escalated on refusal sentence (DB-confirmed) |
+| Test suite | 20 tests, ~5.1 s |
+| bcrypt per hash (WSL venv, hash only) | ~0.22 s (Day 2's 0.36 s was a full login via curl — different measurement) |
+| Share of suite time in fixture setup | 4 of 5 slowest entries are `setup`, ~0.48 s each (2 hashes) |
+| Real JWT secret | 43 bytes (min 32) |
+
+**Also observed:** the refund draft dropped "Renewal charges are not
+refundable" in one run and included it in another within the hour — same
+model, prompt and chunks. Live evidence for why tests fake the LLM.
+
+### Open items
+
+- **Remaining Day 5:** agent endpoint `GET /tickets/{id}` behind JWT; Upstash
+  `rediss://` check; deploy (Neon, Upstash, Render); frontend; README
+- Two Day 4 test tickets missed caches that never expire. **Suspected** Redis
+  has no persistence volume — unverified. Matters for Day 11 hit rate.
+- Draft cache key still uses `settings.groq_model`: the node knows a Groq
+  setting name. Cleaner: model name on the provider.
+- Test DB default URL in `conftest.py` repeats the dev password already in
+  `docker-compose.yml`. Day 12.
+- JWT key length is not enforced by `Settings`; only checked by hand. Day 12.
+- CI (Day 14) will need `TEST_DATABASE_URL`, `CREATE DATABASE`, and
+  `alembic upgrade head` before pytest.
+- Starlette `DeprecationWarning` (anyio alias) — third-party, left visible.
+- If the suite grows: lower bcrypt cost in tests only.
+- **Closed today:** imports inside `get_document`; `session.py` module-level
+  settings (resolved by import order + guard, not refactor); Day 3's
+  "`POST /tickets` has not been called yet".
