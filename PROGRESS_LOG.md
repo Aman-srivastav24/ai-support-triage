@@ -598,3 +598,262 @@ reviewer as well.
 - Groq retired a model mid-project; model name stays in config for this reason.
 - Carried from Day 2: imports inside `get_document`; no `GET /documents` list;
   `session.py` calls `get_settings()` at module level.
+
+  ## Day 4 — Agent, Redis, streaming
+
+**Date:** 24 Sep 2026
+
+### Built
+
+- `app/schemas/classification.py` — `TicketCategory` StrEnum
+  (billing/technical/account/other), `TicketClassification` model
+- `classify_ticket()` in `llm.py` — Groq strict structured output, schema
+  generated from the Pydantic model, temperature 0.0, returns OTHER on any
+  failure rather than raising
+- `app/graph/state.py` — `TriageState` TypedDict, nine fields, `total=False`
+- `app/graph/nodes.py` — `classify`, `make_retrieve_node`, `draft`,
+  `score_confidence`; `_build_query` shared by retrieve and draft
+- `app/graph/triage.py` — `build_triage_graph(db)`, compiled per request,
+  conditional edge on `escalate`, terminal nodes `escalate` / `return_draft`
+- `app/services/cache.py` — the only module that knows Redis exists
+- Caching in three places: query embeddings, classification, drafts
+- `persist_result` and `mark_failed` extracted from `process_ticket` so the
+  blocking and streaming paths share one persistence implementation
+- `TicketAck` schema; `POST /tickets` now returns `{id, status}` only
+- `POST /tickets/stream` — SSE, one event per node as it completes
+- `logging.basicConfig` in `main.py`
+- `scripts/test_classify.py`, `scripts/test_graph.py`, `scripts/strict_test.json`
+
+### What broke
+
+**1. `HTTP 000` read as a fast response — twice**
+Timing runs returned 0.0003 s and looked like excellent performance. The app
+wasn't running; the OS refused the connection instantly. `-s` hid the error
+and `-o /dev/null` discarded the body.
+Rule: every latency measurement prints `%{http_code}` alongside the time. A
+fast failure always looks like a fast success.
+
+**2. Header injection via a pasted newline**
+A curl command had a line break inside the `Authorization` header value.
+Groq returned `invalid character 'C' looking for beginning of value`. The
+blank line separates headers from body in HTTP, so the stray newline ended
+the header block early and `Content-Type: application/json` became the first
+line of the body — hence the `'C'`.
+Same class as SQL and prompt injection: untrusted content crossing into a
+control channel. Fixed by putting request bodies in a file and using `-d @`.
+
+**3. `pydantic-settings` found no `.env`**
+Ran a script from `app/services/`. Four required settings failed validation.
+Config is resolved relative to the working directory.
+Day 1's rule extended: `pydantic-settings` joins git, pip, Compose, Alembic
+and uvicorn on the list of things that must be run from project root.
+The cache module degraded correctly — logged a warning, returned None,
+nothing crashed.
+
+**4. Node logs never reached the container**
+`logger.info` in every node, nothing in `docker compose logs`. uvicorn
+configures its own loggers but not the root logger, whose default level is
+WARNING. Fixed with `logging.basicConfig` in `main.py`. Had been running
+blind since the graph was written.
+
+**5. Measured during a restart**
+Chained `docker compose restart` and a timing run in one paste; curl fired
+while the app was shutting down. `--reload` had already picked up the edit,
+so the restart was unnecessary in the first place.
+Rule: health check between any restart and any measurement.
+
+**6. A node returning `{}` streams as `None`**
+`result.update(changes)` raised `TypeError: 'NoneType' object is not
+iterable` on the terminal node. LangGraph normalises "changed nothing" to
+`None` in the stream, not to an empty dict. Fixed with `if changes:`.
+The error path behaved correctly — client got an `error` event, traceback
+was captured, no hang.
+
+### Decisions
+
+**No self-rated confidence from the model**
+Considered asking the model for a 0–1 confidence alongside the category.
+Rejected: self-reported confidence is poorly calibrated and is high exactly
+when the model is fluently wrong — Day 3's fabricated refund process would
+have scored itself high. Escalation is built from observable facts instead.
+Would revisit as a measured experiment once the Day 6 eval set exists.
+
+**Confidence is rule-based, and similarity is not the decider**
+Escalates when any of: no chunks cleared the floor, the draft contains the
+grounded refusal sentence, or the category is OTHER. Deterministic, no extra
+API call. Day 3 measured the answerable and unanswerable similarity bands
+overlapping, so no threshold can separate them — the strongest signal turned
+out to be the model's own refusal sentence, which came free from grounding.
+Catches absence of grounding; does not catch bad inference over good
+grounding (the Day 3 "signed up last week" case). Day 10 reflection.
+
+**Two tiers, not three**
+Dropped the MEDIUM tier: it returned the draft exactly like HIGH, so the
+label changed nothing. The numeric score is still stored for Day 6 analysis.
+Would earn its place if a real agent queue sorted work by risk.
+
+**Category does not filter retrieval**
+Concrete reason: a ticket reporting error `BIL-409` on the billing page
+classified as `technical`. Filtering retrieval by category would have
+searched troubleshooting docs and missed the billing chunk that contains
+the code. Classification is single-label and some tickets are genuinely
+both.
+
+**`classify_ticket` never raises**
+Classification enriches a ticket; it does not gate one. An unclassified
+ticket can still be retrieved for and drafted. Returns OTHER on failure and
+logs a warning. Same stance as Day 1's `redis_url` having a default.
+
+**Graph built per request, not at startup**
+`make_retrieve_node(db)` closes over the request's session. A graph compiled
+once at startup would hold the first request's session forever. Compiling is
+cheap — wiring and validation, no I/O. The alternative is compiling once and
+passing the session through LangGraph's per-invocation config, which is
+cleaner at scale and more machinery to explain.
+
+**Terminal nodes that return `{}`**
+Both branches end the graph, so routing straight to END would work. Kept
+named terminal nodes because the SSE stream then names the outcome as its
+final event, the trace shows which path ran, and Days 10 and 12 have
+somewhere to hang work. They return `{}` rather than writing a status field:
+`escalate` already carries that fact, and duplicated state can disagree.
+
+**`POST /tickets` returns `{id, status}` only**
+The draft is written for an agent to review. A draft the customer has
+already read is not a draft. Citations, document titles and similarity
+scores are internal — exposing them on a public endpoint lets an anonymous
+caller map the corpus by probing with crafted questions and reading the
+score back. `TicketRead` kept, unused, for the agent endpoint on Day 5.
+
+**Triage failure no longer returns 502**
+Previously a drafting failure returned 502 with no ticket ID, so the caller
+saw a failure and would resubmit a ticket that already existed. Now the
+receipt is returned regardless: the ticket was stored and a human will see
+it. Failures are visible in logs and in the row's status.
+
+**Embedding caching is opt-in per call**
+Ingestion embeds each chunk once and would never read the key back; ticket
+queries repeat. The caller knows whether repetition is likely, the service
+does not. `use_cache=False` by default.
+
+**Cache keys carry everything that determines the value**
+Embeddings: model + task type + dimensions. Gemini embeds a query
+differently from a document, so serving one for the other would corrupt
+results with no error anywhere. Classification: model. Drafts: model +
+query + sorted chunk IDs.
+
+**Only the draft cache has a TTL**
+Embeddings and classifications are pure functions of their inputs, and every
+input is in the key. Drafts depend on the corpus, which changes on upload.
+Chunk IDs in the key catch a different retrieval; the 300 s TTL catches an
+edit that keeps the same chunks. 300 s is a starting point, not a derived
+value — it would be tuned against how often documents actually change.
+
+**Cache failures are never fatal**
+Every operation in `cache.py` swallows exceptions and returns None, so a
+Redis outage and a cache miss are indistinguishable to callers. Slower,
+still correct.
+
+**Never cache a fallback**
+`set_json` for classification sits outside the `try`. Caching the OTHER
+fallback after a network blip would make that ticket text permanently
+miscategorised.
+
+**SSE, not WebSockets**
+Traffic is one-directional: the client submits and then only listens. SSE is
+plain HTTP, works through proxies, reconnects automatically. WebSockets
+would add a return channel never used.
+
+**Streaming is a separate endpoint**
+A client wanting a JSON receipt should not have to parse an event stream.
+
+**`_progress_event` is a whitelist**
+Names exactly which fields leave, per node. A blacklist breaks the day
+someone adds a field.
+
+### Numbers
+
+| Phase | Mean | External calls |
+|---|---|---|
+| Day 3 pipeline (pre-graph) | 1.48 s | 2 |
+| With graph, no cache | 2.04 s | 3 |
+| + embedding cached | 1.05 – 1.51 s | 2 |
+| + classification cached | 0.60 s | 1 |
+| + draft cached | **0.062 s** | 0 |
+
+**2.04 s → 0.062 s, a 33× speedup — best case only.**
+
+Per-stage, cold request:
+
+| Stage | Cold | Warm |
+|---|---|---|
+| Classify (Groq) | ~0.45 s | 0.002 s |
+| Embedding (Gemini) | 0.57 – 0.89 s | 0.002 s |
+| Vector search (pgvector) | 0.017 s | 0.005 s |
+| Draft (Groq) | 0.35 – 0.69 s | 0.557 s |
+
+~95 % of cold latency is external API calls. The database is under 1 %.
+Provider variance is large: the same request measured 0.57 s and 0.89 s for
+the embedding, 0.35 s and 0.69 s for the draft. Quote ranges, not points.
+
+Classification cost: 195 prompt + 97 completion tokens, of which 78 were
+reasoning. `gpt-oss-20b` is a reasoning model, so 80 % of the output tokens
+were thinking to produce a 5-token answer. Groq `queue_time` 0.315 s against
+`total_time` 0.118 s — on free tier, queueing dominates.
+
+Graph results, three tickets:
+
+| Ticket | Category | Chunks | Confidence | Escalated |
+|---|---|---|---|---|
+| Refund window | billing | 2 | 0.6572 | no |
+| Student discount | billing | 2 | 0.5874 | yes — refusal sentence |
+| Sunday hours | other | 3 | 0.5672 | yes — refusal + other |
+
+The student-discount ticket scored 0.5874, above the 0.55 floor, on a
+question the corpus cannot answer. It escalated on the refusal sentence,
+which has nothing to do with the score. Day 3's band overlap, reproduced.
+
+**Also measured:** including the subject in the query, not just the body,
+changed the draft for "Refund window" from `14 days.` to
+`Refunds are available within 14 days of the first charge on a new
+subscription. Renewal charges are not refundable.` Same model, same prompt,
+same chunks. The terse answer had looked like a prompt problem; the input
+was impoverished. Check what you are sending before tuning a prompt.
+
+### API surface after Day 4
+
+| Method | Path | Auth | Success | Returns |
+|---|---|---|---|---|
+| POST | `/tickets` | none | 201 | `{id, status}` |
+| POST | `/tickets/stream` | none | 200 | SSE progress events |
+
+Stream events, in order: `received`, `classified`, `retrieved`, `drafted`,
+`scored`, then `escalate` or `return_draft`, then `done`.
+
+### Open items
+
+- **33× is best case only.** Requires identical text within the TTL. Real
+  traffic repeats questions with different wording, which an exact-text hash
+  misses entirely. Hit rate unmeasured — needs `/metrics` on Day 11. Semantic
+  caching (matching on embedding similarity) would catch rephrasing, but
+  needs the embedding first, so it saves only the generation call.
+- `reasoning_effort: low` untested for classification. 80 % of output tokens
+  were reasoning for a four-way choice. Day 11.
+- A ticket classified OTHER still runs retrieve and draft before escalating —
+  three API calls to reach a conclusion `classify` had at step one. Early exit
+  would save two calls per off-topic ticket. Day 11.
+- Classification is single-label. The BIL-409 ticket was genuinely both
+  technical and billing. Multi-label is the real fix; out of scope.
+- `docker-compose.yml` hardcodes `POSTGRES_PASSWORD: triage` and is committed.
+  Should use env substitution like `JWT_SECRET_KEY` does. Day 12.
+- httpx logs every request at INFO now. Useful for timing, noisy later.
+  Silence on Day 11 when structured logging arrives.
+- Drafts are cached despite `temperature: 0.2`, so identical questions get
+  byte-identical answers for 300 s. A behaviour change, not only a speed one.
+- Carried from Day 3: each sample doc is 1 chunk, so overlap and mid-sentence
+  cuts are untested; `used_in_reply` always false; ingestion embeds serially.
+- Carried from Day 2: imports inside `get_document`; no `GET /documents` list;
+  `session.py` calls `get_settings()` at module level, which blocks the
+  dependency-override hook needed for Day 5 tests.
+- No agent-facing endpoint yet. `TicketRead` exists but nothing serves it, so
+  nothing can currently read a draft. Day 5.

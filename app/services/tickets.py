@@ -36,12 +36,49 @@ def create_ticket(
     return ticket
 
 
+def persist_result(db: Session, ticket: Ticket, result: dict) -> Ticket:
+    """Map a completed graph result onto the ticket row and commit.
+
+    The single place that knows how graph output becomes a row. Both the
+    blocking endpoint and the streaming one call this, so the two paths
+    cannot drift apart in what they store.
+    """
+    ticket.category = result["category"]
+    ticket.draft_reply = result["draft"]
+    ticket.confidence = result["confidence"]
+    ticket.escalation_reason = result["escalation_reason"]
+    ticket.status = (
+        TicketStatus.ESCALATED if result["escalate"] else TicketStatus.DRAFTED
+    )
+
+    _store_citations(db, ticket, result["chunks"])
+
+    ticket.processed_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(ticket)
+    return ticket
+
+
+def mark_failed(db: Session, ticket_id: uuid.UUID, reason: str) -> None:
+    """Record that triage failed for this ticket.
+
+    Re-fetches after rollback: the caller's object may be stale or detached
+    by the time this runs, and writing to a detached instance is unreliable.
+    """
+    db.rollback()
+    ticket = db.get(Ticket, ticket_id)
+    if ticket is None:
+        return
+    ticket.status = TicketStatus.FAILED
+    ticket.escalation_reason = reason[:1000]
+    ticket.processed_at = datetime.now(timezone.utc)
+    db.commit()
+
+
 def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
     """Run the ticket through the triage graph and persist the outcome.
 
-    The graph decides; this function owns the database. Keeping every write
-    here means one transaction to reason about and one place that knows how
-    a graph result maps onto a row.
+    The graph decides; this function owns the database.
     """
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
@@ -59,31 +96,10 @@ def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
                 "body": ticket.body,
             }
         )
-
-        ticket.category = result["category"]
-        ticket.draft_reply = result["draft"]
-        ticket.confidence = result["confidence"]
-        ticket.escalation_reason = result["escalation_reason"]
-        ticket.status = (
-            TicketStatus.ESCALATED if result["escalate"] else TicketStatus.DRAFTED
-        )
-
-        _store_citations(db, ticket, result["chunks"])
-
-        ticket.processed_at = datetime.now(timezone.utc)
-        db.commit()
-        db.refresh(ticket)
-        return ticket
+        return persist_result(db, ticket, result)
 
     except Exception as exc:
-        db.rollback()
-        # Re-fetch: after a rollback the object above may be stale or detached.
-        ticket = db.get(Ticket, ticket_id)
-        if ticket is not None:
-            ticket.status = TicketStatus.FAILED
-            ticket.escalation_reason = str(exc)[:1000]
-            ticket.processed_at = datetime.now(timezone.utc)
-            db.commit()
+        mark_failed(db, ticket_id, str(exc))
         logger.exception("ticket %s: processing failed", ticket_id)
         raise
 
