@@ -1,26 +1,25 @@
 # Day 4 — What I Learned
 
-## 🧭 Day 4 at a Glance
+## Day 4 at a Glance
 
 ```mermaid
 flowchart LR
-    A[Day 3<br/>Fixed RAG chain] --> B[Day 4<br/>Decision-making]
-    B --> C[Graph + shared state]
-    B --> D[Workflow vs Agent]
-    B --> E[Structured outputs]
-    B --> F[Escalation logic]
-    B --> G[Redis caching]
-    B --> H[SSE streaming]
-    B --> I[Public vs agent API]
-    B --> J[Debugging + measurements]
+    A["Day 3<br/>Fixed RAG chain"] --> B["Day 4<br/>Decision-making"]
+    B --> C["Graph + shared state"]
+    B --> D["Workflow vs Agent"]
+    B --> E["Structured outputs"]
+    B --> F["Escalation logic"]
+    B --> G["Redis caching"]
+    B --> H["SSE streaming"]
+    B --> I["Public vs agent API"]
+    B --> J["Debugging + measurements"]
 ```
 
-### 🧠 The one-line mental model
+### The one-line mental model
 
 **Day 4 = turn a fixed RAG pipeline into a controlled workflow that can route, cache, stream progress, and safely keep a human in the loop.**
 
 ---
-
 
 Everything from Day 4, explained from scratch.
 
@@ -28,40 +27,38 @@ Everything from Day 4, explained from scratch.
 
 ## Part 1: Chains and Graphs
 
-### 👀 Visual: Chain vs Graph
+### Visual: Chain vs Graph
 
 ```mermaid
 flowchart LR
-    subgraph CHAIN[Chain — fixed path]
-        C1[Retrieve] --> C2[Draft] --> C3[Done]
+    subgraph CHAIN["Chain — fixed path"]
+        C1["Retrieve"] --> C2["Draft"] --> C3["Done"]
     end
 
-    subgraph GRAPH[Graph — path can branch]
-        G1[Classify] --> G2[Retrieve] --> G3[Draft] --> G4{Good enough?}
-        G4 -->|Yes| G5[Return draft]
-        G4 -->|No| G6[Escalate]
+    subgraph GRAPH["Graph — path can branch"]
+        G1["Classify"] --> G2["Retrieve"] --> G3["Draft"] --> G4{"Good enough?"}
+        G4 -->|Yes| G5["Return draft"]
+        G4 -->|No| G6["Escalate"]
     end
 ```
 
-### 📋 Visual: Shared State / Clipboard
+### Visual: Shared State / Clipboard
 
 ```mermaid
 flowchart TD
-    S[(Shared State)]
-    A[START<br/>ticket_id, subject, body] --> S
-    S --> B[Classify<br/>adds category]
+    S[("Shared State")]
+    A["START<br/>ticket_id, subject, body"] --> S
+    S --> B["Classify<br/>adds category"]
     B --> S
-    S --> C[Retrieve<br/>adds chunks]
+    S --> C["Retrieve<br/>adds chunks"]
     C --> S
-    S --> D[Draft<br/>adds draft]
+    S --> D["Draft<br/>adds draft"]
     D --> S
-    S --> E[Score confidence<br/>adds escalate/reason]
+    S --> E["Score confidence<br/>adds escalate + reason"]
     E --> S
 ```
 
 > **Remember:** State = data. Routing = a separate decision about the next node.
-
-
 
 ### The problem
 
@@ -180,33 +177,33 @@ interviewer asks, I lead with the bounded retry loop.
 
 ## Part 2: Agents
 
-### 👀 Visual: Workflow vs Agent
+### Visual: Workflow vs Agent
 
 ```mermaid
 flowchart TB
-    subgraph W[Workflow — my code decides]
-        W1[Input] --> W2[LLM: classify] --> W3[Python routing] --> W4[Fixed next step]
+    subgraph W["Workflow — my code decides"]
+        W1["Input"] --> W2["LLM: classify"] --> W3["Python routing"] --> W4["Fixed next step"]
     end
 
-    subgraph A[Agent — model decides]\n        A1[Input] --> A2[LLM decides action] --> A3[Tool] --> A4[Observation] --> A2
-        A2 -->|finish| A5[Answer]
+    subgraph A["Agent — model decides"]
+        A1["Input"] --> A2["LLM decides action"]
+        A2 --> A3["Tool"] --> A4["Observation"] --> A2
+        A2 -->|finish| A5["Answer"]
     end
 ```
 
-### 🔐 Visual: Tool Calling Security Boundary
+### Visual: Tool Calling Security Boundary
 
 ```mermaid
 flowchart LR
-    U[User / Ticket] --> M[LLM]
-    M -->|Structured request| V[Your validation code]
-    V -->|allowed + valid| T[Real Python tool]
-    V -->|invalid / unauthorized| X[Reject]
-    T --> O[Tool result] --> M
+    U["User / Ticket"] --> M["LLM"]
+    M -->|"Structured request"| V["My validation code"]
+    V -->|"allowed + valid"| T["Real Python tool"]
+    V -->|"invalid / unauthorised"| X["Reject"]
+    T --> O["Tool result"] --> M
 ```
 
 > **Key sentence:** The model emits a structured request; my code validates it and decides whether to execute it.
-
-
 
 ### The one question that matters
 
@@ -312,30 +309,24 @@ is "what does it decide on its own?"
 
 ## Part 3: Structured Outputs
 
-### 👀 Visual: Three Levels of Output Control
+### Visual: Three Levels of Output Control
 
 ```mermaid
 flowchart LR
-    A[Ask nicely
-"billing"] --> B[JSON mode
-valid JSON]
-    B --> C[Schema-enforced
-allowed fields + values]
-    C --> D[Pydantic validation
-final application check]
+    A["Ask nicely<br/>hope for one word"] --> B["JSON mode<br/>valid JSON guaranteed"]
+    B --> C["Schema-enforced<br/>my fields, my values"]
+    C --> D["Pydantic validation<br/>final check in my code"]
 ```
 
-### 🎯 What schema enforcement does — and does NOT do
+### What schema enforcement does — and does NOT do
 
 ```mermaid
 flowchart TD
-    A[Schema] --> B[Controls shape]
-    B --> C[category must be one of allowed values]
-    C --> D[Still may be the wrong category]
-    D --> E[Shape ≠ truth]
+    A["Schema"] --> B["Controls the shape"]
+    B --> C["category must be one of my four values"]
+    C --> D["It can still be the WRONG value"]
+    D --> E["Shape is guaranteed. Truth is not."]
 ```
-
-
 
 ### The problem
 
@@ -414,32 +405,38 @@ Validation costs microseconds. Skipping it costs a 2am incident.
 
 ## Part 4: Deciding When to Escalate
 
-### 👀 Visual: Escalation Decision
+### Visual: Escalation Decision
 
 ```mermaid
 flowchart TD
-    S[Ticket processed] --> Q{Any document above floor?}
-    Q -->|No| E[ESCALATE]
-    Q -->|Yes| R{Draft contains refusal sentence?}
+    S["Ticket processed"] --> Q{"Any document above floor?"}
+    Q -->|No| E["ESCALATE"]
+    Q -->|Yes| R{"Draft contains refusal sentence?"}
     R -->|Yes| E
-    R -->|No| O{Category = other?}
+    R -->|No| O{"Category = other?"}
     O -->|Yes| E
-    O -->|No| D[RETURN DRAFT]
+    O -->|No| D["RETURN DRAFT"]
 ```
 
-### ⚠️ Why similarity alone is not enough
+### Why similarity alone is not enough
 
-```mermaid
-xychart-beta
-    title "Measured similarity bands from Day 3"
-    x-axis [Unrelated, Cannot-answer, Can-answer]
-    y-axis "Similarity" 0.50 --> 0.67
-    bar [0.520, 0.596, 0.622]
-```
+These are the actual measured ranges from Day 3. The point is the **overlap**:
 
-> The chart shows representative values from the ranges documented below; the important point is the **overlap**, not the exact bar height.
+    0.51   0.53   0.55   0.57   0.59   0.61   0.63   0.65
+     |      |      |      |      |      |      |      |
+    Unrelated
+     ●━━━━━●                                              0.515 – 0.525
+                        ↑ SIMILARITY_FLOOR = 0.55
+    Cannot answer
+                    ●━━━━━━━━●                            0.586 – 0.605
+    CAN answer
+                    ●━━━━━━━━━━━━━━━━━━━━━━━━━━━●         0.587 – 0.656
+                    └──── OVERLAP ────┘
 
-
+The unrelated band separates cleanly — that's what the floor is for.
+**The other two do not.** Any threshold drawn inside the overlap splits both
+groups arbitrarily. This is why the escalation rules above use the refusal
+sentence and the category, not the number.
 
 This was the real design work of the day.
 
@@ -564,46 +561,44 @@ tickets we returned, what did they score, and were any wrong?"
 
 ## Part 5: Caching
 
-### 👀 Visual: Cache Flow
+### Visual: Cache Flow
 
 ```mermaid
 flowchart LR
-    R[Request] --> K[Build cache key]
-    K --> H{Cache hit?}
-    H -->|Yes| V[Return cached value]
-    H -->|No| L[Call external API / DB]
-    L --> S[Store result + optional TTL]
+    R["Request"] --> K["Build cache key"]
+    K --> H{"Cache hit?"}
+    H -->|Yes| V["Return cached value"]
+    H -->|No| L["Call external API"]
+    L --> S["Store result + optional TTL"]
     S --> V
-    R -. Redis unavailable .-> L
+    R -. "Redis unavailable" .-> L
 ```
 
-### 🧩 Cache-key mental model
+### Cache-key mental model
 
 ```mermaid
 flowchart TD
-    T[Input text] --> H[SHA-256 hash]
-    M[Model] --> K[Cache key]
-    P[Task / purpose] --> K
-    D[Dimensions / document IDs when relevant] --> K
+    T["Input text"] --> H["SHA-256 hash"]
+    M["Model name"] --> K["Cache key"]
+    P["Task type"] --> K
+    D["Dimensions / document IDs"] --> K
     H --> K
-    K --> R[(Redis)]
+    K --> R[("Redis")]
 ```
 
 > **Rule:** Everything that can change the answer belongs in the cache key.
 
-### 🚦 Cache reliability principle
+### Cache reliability principle
 
 ```mermaid
 flowchart LR
-    A[App] --> R[(Redis)]
-    R -->|hit| F[Fast result]
-    R -->|miss / outage| S[Run normal slow path]
+    A["App"] --> R[("Redis")]
+    R -->|hit| F["Fast result"]
+    R -->|"miss or outage"| S["Run the normal slow path"]
     S --> F
 ```
 
-> **Cache is an optimization, not a requirement.**
-
-
+> **A cache is an optimisation, not a requirement.**
 
 ### What caching is
 
@@ -734,6 +729,11 @@ and save nothing.
 | + Classification | 0.60 s | 1 |
 | + Draft | **0.062 s** | 0 |
 
+    No cache        ████████████████████████████████████  2.04 s
+    + embedding     ██████████████████                    1.05 s
+    + classify      ██████████                            0.60 s
+    + draft         █                                     0.062 s
+
 **2.04 seconds down to 62 milliseconds. 33× faster.**
 
 ### Why I must not just say "33× faster"
@@ -761,17 +761,17 @@ the generation call, not the embedding call."
 
 ## Part 6: Streaming (SSE)
 
-### 👀 Visual: Normal HTTP vs SSE
+### Visual: Normal HTTP vs SSE
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server
     C->>S: Submit ticket
-    Note over C,S: Normal HTTP: wait...
+    Note over C,S: Normal HTTP — 2 seconds of silence
     S-->>C: Everything at once
 
-    C->>S: Submit ticket
+    C->>S: Submit ticket (streaming)
     S-->>C: classified
     S-->>C: retrieved
     S-->>C: drafted
@@ -779,20 +779,15 @@ sequenceDiagram
     S-->>C: done
 ```
 
-### 📡 SSE vs WebSockets
+### SSE vs WebSockets
 
 ```mermaid
 flowchart TB
-    A[Client submits ticket] --> B[SSE
-server → client progress]
-    A --> C[WebSocket
-two-way communication]
-    B --> D[Best fit for this project]
-    C --> E[Useful for interactive two-way apps
-such as live chat]
+    A["Client submits ticket"] --> B["SSE<br/>server to client only"]
+    A --> C["WebSocket<br/>two-way channel"]
+    B --> D["Best fit here — client only listens"]
+    C --> E["Needed for live chat<br/>where the client also sends"]
 ```
-
-
 
 ### The problem
 
@@ -893,34 +888,30 @@ breaks the day someone adds a new field.
 
 ## Part 7: What the Customer Should See
 
-### 👀 Visual: Public vs Agent Flow
+### Visual: Public vs Agent Flow
 
 ```mermaid
 flowchart LR
-    C[Customer] -->|POST ticket| P[Public API]
-    P --> R[Ticket receipt
-id + status]
-    P --> G[Background triage graph]
-    G --> DB[(Database)]
-    DB --> A[Agent / reviewer]
-    A -->|Edit + approve| E[Approved reply]
-    E --> M[Email delivery]
+    C["Customer"] -->|"POST ticket"| P["Public API"]
+    P --> R["Receipt<br/>id + status"]
+    R --> C
+    P --> G["Triage graph"]
+    G --> DB[("Database")]
+    DB --> A["Agent / reviewer"]
+    A -->|"Edit + approve"| E["Approved reply"]
+    E --> M["Email delivery"]
     M --> C
 ```
 
-### 🔒 Two API schemas, two audiences
+### Two API schemas, two audiences
 
 ```mermaid
 flowchart TD
-    T[Ticket data] --> P[TicketAck
-public: id + status]
-    T --> A[TicketRead
-agent: full internal data]
-    P --> C[Customer]
-    A --> R[Reviewer]
+    T["Ticket data"] --> P["TicketAck<br/>public: id + status"]
+    T --> A["TicketRead<br/>agent: full internal data"]
+    P --> C["Customer"]
+    A --> R["Reviewer"]
 ```
-
-
 
 ### The question I got wrong at first
 
@@ -1005,30 +996,26 @@ can't.
 
 ## Part 8: Debugging Lessons
 
-### 🧭 Debugging loop
+### Debugging loop
 
 ```mermaid
 flowchart TD
-    E[Something failed] --> I[Check input]
-    I --> S[Check status / response]
-    S --> T[Check timing + logs]
-    T --> X[Read traceback location]
-    X --> C[Check config / environment]
-    C --> F[Fix smallest broken link]
-    F --> V[Health check + re-measure]
+    E["Something failed"] --> I["Check the input"]
+    I --> S["Check status code, not just timing"]
+    S --> T["Check logs for the per-stage trace"]
+    T --> X["Read WHERE in the chain it broke"]
+    X --> C["Check config and working directory"]
+    C --> F["Fix the smallest broken link"]
+    F --> V["Health check, then re-measure"]
 ```
 
-### ⏱️ Where the time went
+### Where the time went
 
 ```mermaid
 flowchart LR
-    A[External APIs
-~95% latency] --> B[Model calls dominate]
-    C[Database
-<1% latency] --> D[SQL tuning is not the main lever]
+    A["External API calls<br/>~95% of latency"] --> B["Only lever worth pulling"]
+    C["Database<br/>under 1% of latency"] --> D["SQL tuning would be pointless"]
 ```
-
-
 
 These cost me real time today. Writing them down so they cost me less next
 time.
@@ -1183,20 +1170,6 @@ instead of hanging, and the full traceback was captured.
 
 ## The Numbers I Can Quote
 
-### 📊 Performance at a glance
-
-```mermaid
-xychart-beta
-    title "Ticket latency: cache state"
-    x-axis [No cache, Embedding, + Classification, + Draft]
-    y-axis "Seconds" 0 --> 2.2
-    bar [2.04, 1.05, 0.60, 0.062]
-```
-
-> **Best-case repeated identical query:** 2.04 s → 0.062 s. The original notes correctly caution that real production hit rate is still unknown.
-
-
-
 | Measurement | Value |
 |---|---|
 | Ticket, no cache | 2.04 s |
@@ -1218,21 +1191,19 @@ the provider's response time did.
 
 ## Questions I Should Be Able to Answer Cold
 
-### 🎤 Interview map
+### Interview map
 
 ```mermaid
 flowchart LR
-    A[Architecture] --> B[Why graph?]
-    A --> C[Workflow vs agent?]
-    D[Correctness] --> E[How escalate?]
-    D --> F[What does confidence miss?]
-    G[Performance] --> H[What is cached?]
-    G --> I[What is the measured speedup?]
-    J[API design] --> K[Why hide draft?]
-    J --> L[Why SSE?]
+    A["Architecture"] --> B["Why a graph?"]
+    A --> C["Workflow or agent?"]
+    D["Correctness"] --> E["How do you escalate?"]
+    D --> F["What does confidence miss?"]
+    G["Performance"] --> H["What is cached?"]
+    G --> I["What is the measured speedup?"]
+    J["API design"] --> K["Why hide the draft?"]
+    J --> L["Why SSE?"]
 ```
-
-
 
 **What makes this an agent rather than one big prompt?**
 Right now it isn't a full agent — it's a workflow with one LLM-informed
