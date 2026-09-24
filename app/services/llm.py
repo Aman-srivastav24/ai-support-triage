@@ -6,6 +6,7 @@ import httpx
 
 from app.core.config import get_settings
 from app.schemas.classification import TicketCategory, TicketClassification
+from app.services.cache import get_json, make_key, set_json
 
 logger = logging.getLogger(__name__)
 
@@ -93,8 +94,19 @@ def classify_ticket(subject: str, body: str) -> TicketCategory:
     Classification is an enrichment, not a precondition: an unclassified
     ticket can still be retrieved for and drafted. Failing the whole ticket
     because this step broke would turn a nice-to-have into a hard dependency.
+
+    Cached with no TTL. At temperature 0.0 the result is deterministic, and
+    unlike a draft it depends only on the ticket text — the corpus can change
+    without changing the category. The model name is in the key, so switching
+    models produces new keys rather than stale hits.
     """
     settings = get_settings()
+    cache_key = make_key("classify", settings.groq_model, f"{subject}\n{body}")
+
+    cached = get_json(cache_key)
+    if cached is not None:
+        logger.info("classification cache hit")
+        return TicketCategory(cached)
 
     payload = {
         "model": settings.groq_model,
@@ -122,7 +134,12 @@ def classify_ticket(subject: str, body: str) -> TicketCategory:
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
-        return TicketClassification.model_validate_json(content).category
+        category = TicketClassification.model_validate_json(content).category
     except Exception as exc:
         logger.warning("classification failed, defaulting to OTHER: %s", exc)
         return TicketCategory.OTHER
+
+    # Outside the try: a failure returns OTHER and caches nothing. Caching a
+    # fallback would make one network blip permanent for that ticket text.
+    set_json(cache_key, category.value)
+    return category

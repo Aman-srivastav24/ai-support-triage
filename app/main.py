@@ -5,7 +5,12 @@ from app.api.health import router as health_router
 from app.core.config import get_settings
 from app.api.documents import router as documents_router
 from app.api.tickets import router as tickets_router
+import logging
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
 settings = get_settings() #importing from app.core.config
 
 app = FastAPI(

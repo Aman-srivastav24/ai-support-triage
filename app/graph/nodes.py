@@ -9,8 +9,10 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.graph.state import TriageState
 from app.schemas.classification import TicketCategory
+from app.services.cache import get_json, make_key, set_json
 from app.services.llm import classify_ticket, draft_answer
 from app.services.retrieval import search_chunks
 
@@ -27,6 +29,11 @@ REFUSAL_SENTENCE = "The documentation does not cover this."
 SIMILARITY_FLOOR = 0.55
 
 TOP_K = 3
+
+# Drafts depend on the corpus, which changes when an admin uploads a
+# document. Five minutes is a starting point, not a derived value — it
+# would be tuned against how often the documents actually change.
+DRAFT_CACHE_TTL_SECONDS = 300
 
 
 def _build_query(state: TriageState) -> str:
@@ -68,7 +75,13 @@ def make_retrieve_node(db: Session):
 
 
 def draft(state: TriageState) -> dict:
-    """Draft a grounded reply from the retrieved chunks."""
+    """Draft a grounded reply from the retrieved chunks.
+
+    Cached on the question AND the chunk IDs, because unlike classification
+    this output depends on the corpus, not just the input. A short TTL backs
+    that up: keying on chunk IDs catches a different retrieval, but not an
+    edit to a document that keeps the same chunks.
+    """
     chunks = state["chunks"]
 
     if not chunks:
@@ -76,7 +89,22 @@ def draft(state: TriageState) -> dict:
         # spend an API call to produce the refusal sentence we can write here.
         return {"draft": REFUSAL_SENTENCE}
 
-    answer = draft_answer(_build_query(state), [c.content for c in chunks])
+    query = _build_query(state)
+    settings = get_settings()
+
+    # Chunk IDs are part of the key: the same question over different
+    # retrieved context is a different question. Sorted so the fingerprint
+    # is stable for the same set of chunks regardless of retrieval order.
+    chunk_fingerprint = ",".join(sorted(c.chunk_id for c in chunks))
+    cache_key = make_key("draft", settings.groq_model, f"{query}||{chunk_fingerprint}")
+
+    cached = get_json(cache_key)
+    if cached is not None:
+        logger.info("draft cache hit")
+        return {"draft": cached}
+
+    answer = draft_answer(query, [c.content for c in chunks])
+    set_json(cache_key, answer, ttl_seconds=DRAFT_CACHE_TTL_SECONDS)
     return {"draft": answer}
 
 

@@ -30,7 +30,7 @@ def search_chunks(
     top_k: int = DEFAULT_TOP_K,
 ) -> list[RetrievedChunk]:
     """Return the top_k chunks most similar to `query`, best first."""
-    query_embedding = embed_text(query, task_type="RETRIEVAL_QUERY")
+    query_embedding = embed_text(query, task_type="RETRIEVAL_QUERY", use_cache=True)
 
     distance = Chunk.embedding.cosine_distance(query_embedding)
 
