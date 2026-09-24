@@ -4,6 +4,7 @@ import time
 
 from app.db.session import SessionLocal
 from app.services.retrieval import search_chunks
+from app.services.providers import GeminiEmbedder
 
 QUESTIONS = [
     # --- clearly answered by the corpus ---
@@ -27,7 +28,7 @@ def main() -> None:
     try:
         for label, question in QUESTIONS:
             started = time.perf_counter()
-            results = search_chunks(db, question, top_k=3)
+            results = search_chunks(db, question, embedder=GeminiEmbedder(), top_k=3)
             elapsed = time.perf_counter() - started
 
             print(f"\n[{label}] {question}")

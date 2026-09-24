@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid  # ← CHANGE (moved up from inside get_document)
 from typing import Annotated
 
 from fastapi import (
@@ -14,7 +15,8 @@ from fastapi import (
     status,
 )
 
-from app.api.deps import AdminUser, DbSession
+from app.api.deps import AdminUser, DbSession, EmbeddingProvider  # ← CHANGE
+from app.models.document import Document  # ← CHANGE (moved up from inside get_document)
 from app.schemas.document import DocumentRead
 from app.services.documents import (
     DuplicateDocument,
@@ -37,6 +39,7 @@ async def upload_document(
     background_tasks: BackgroundTasks,
     admin: AdminUser,
     db: DbSession,
+    embedder: EmbeddingProvider,  # ← CHANGE
     file: Annotated[UploadFile, File()],
     title: Annotated[str | None, Form(max_length=255)] = None,
 ) -> DocumentRead:
@@ -81,17 +84,13 @@ async def upload_document(
             detail=f"Identical document already exists: {exc}",
         ) from None
 
-    background_tasks.add_task(ingest_document, document.id)
+    background_tasks.add_task(ingest_document, document.id, embedder=embedder)  # ← CHANGE
     return document
 
 
 @router.get("/{document_id}", response_model=DocumentRead)
 def get_document(document_id: str, admin: AdminUser, db: DbSession) -> DocumentRead:
     """Check a document's ingestion status."""
-    import uuid
-
-    from app.models.document import Document
-
     try:
         parsed = uuid.UUID(document_id)
     except ValueError:

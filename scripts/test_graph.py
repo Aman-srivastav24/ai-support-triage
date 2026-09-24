@@ -8,6 +8,7 @@ import uuid
 
 from app.db.session import SessionLocal
 from app.graph.triage import build_triage_graph
+from app.services.providers import GeminiEmbedder, GroqLLM
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -19,7 +20,7 @@ CASES = [
 
 db = SessionLocal()
 try:
-    graph = build_triage_graph(db)
+    graph = build_triage_graph(db, llm=GroqLLM(), embedder=GeminiEmbedder())
 
     for subject, body in CASES:
         print(f"\n{'=' * 70}\n{subject}\n{'=' * 70}")

@@ -5,6 +5,7 @@ import time
 from app.db.session import SessionLocal
 from app.services.llm import draft_answer
 from app.services.retrieval import search_chunks
+from app.services.providers import GeminiEmbedder
 import sys
 
 QUESTION = sys.argv[1] if len(sys.argv) > 1 else "How long do I have to request a refund on my subscription?"
@@ -13,7 +14,7 @@ QUESTION = sys.argv[1] if len(sys.argv) > 1 else "How long do I have to request 
 def main() -> None:
     db = SessionLocal()
     try:
-        hits = search_chunks(db, QUESTION, top_k=3)
+        hits = search_chunks(db, QUESTION, embedder=GeminiEmbedder(), top_k=3)
 
         print(f"Question: {QUESTION}\n")
         print("Retrieved:")

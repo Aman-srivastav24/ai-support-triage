@@ -1,7 +1,8 @@
 """Assembly of the triage graph.
 
-Built per request because the retrieve node closes over that request's
-database session. Compiling is cheap — no I/O, just wiring and validation.
+Built per request because nodes close over that request's database session,
+LLM client and embedder. Compiling is cheap — no I/O, just wiring and
+validation.
 
     START → classify → retrieve → draft → score_confidence ─┬→ escalate     → END
                                                             └→ return_draft → END
@@ -10,8 +11,14 @@ database session. Compiling is cheap — no I/O, just wiring and validation.
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import Session
 
-from app.graph.nodes import classify, draft, make_retrieve_node, score_confidence
+from app.graph.nodes import (  # ← CHANGE (factories instead of plain nodes)
+    make_classify_node,
+    make_draft_node,
+    make_retrieve_node,
+    score_confidence,
+)
 from app.graph.state import TriageState
+from app.services.providers import Embedder, LLMClient  # ← CHANGE
 
 
 def _escalate(state: TriageState) -> dict:
@@ -40,13 +47,18 @@ def _route(state: TriageState) -> str:
     return "escalate" if state["escalate"] else "return_draft"
 
 
-def build_triage_graph(db: Session):
+def build_triage_graph(
+    db: Session,
+    *,
+    llm: LLMClient,  # ← CHANGE
+    embedder: Embedder,  # ← CHANGE
+):
     """Compile the triage graph for one request."""
     graph = StateGraph(TriageState)
 
-    graph.add_node("classify", classify)
-    graph.add_node("retrieve", make_retrieve_node(db))
-    graph.add_node("draft", draft)
+    graph.add_node("classify", make_classify_node(llm))  # ← CHANGE
+    graph.add_node("retrieve", make_retrieve_node(db, embedder))  # ← CHANGE
+    graph.add_node("draft", make_draft_node(llm))  # ← CHANGE
     graph.add_node("score_confidence", score_confidence)
     graph.add_node("escalate", _escalate)
     graph.add_node("return_draft", _return_draft)

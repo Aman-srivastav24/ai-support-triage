@@ -13,8 +13,8 @@ from sqlalchemy.orm import Session
 from app.db.session import SessionLocal
 from app.models.chunk import Chunk
 from app.models.document import Document, DocumentStatus
-from app.services.embeddings import EmbeddingError, embed_text
 from app.services.chunking import chunk_text
+from app.services.providers import Embedder  # ← CHANGE (replaces embeddings import)
 
 logger = logging.getLogger(__name__)
 
@@ -67,11 +67,16 @@ def create_document(
     return document
 
 
-def ingest_document(document_id: uuid.UUID) -> None:
+def ingest_document(
+    document_id: uuid.UUID,
+    *,
+    embedder: Embedder,  # ← CHANGE
+) -> None:
     """Chunk a document and store the chunks. Runs in the background.
 
     Opens its own session: the request's session is closed by the time
-    this runs.
+    this runs. The embedder is passed in by the route, so tests can
+    substitute a fake without touching this function.
     """
     db = SessionLocal()
     try:
@@ -89,7 +94,9 @@ def ingest_document(document_id: uuid.UUID) -> None:
                 raise ValueError("document produced no chunks")
 
             for c in chunks:
-                embedding = embed_text(c.content, task_type="RETRIEVAL_DOCUMENT")
+                embedding = embedder.embed(  # ← CHANGE (was embed_text)
+                    c.content, task_type="RETRIEVAL_DOCUMENT"
+                )
                 db.add(
                     Chunk(
                         document_id=document.id,

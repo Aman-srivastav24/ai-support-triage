@@ -7,7 +7,7 @@ from collections.abc import Iterator
 from fastapi import APIRouter, status
 from fastapi.responses import StreamingResponse
 
-from app.api.deps import DbSession
+from app.api.deps import DbSession, EmbeddingProvider, LLMProvider  # ← CHANGE
 from app.graph.triage import build_triage_graph
 from app.models.ticket import TicketStatus
 from app.schemas.ticket import TicketAck, TicketCreate
@@ -19,7 +19,12 @@ router = APIRouter(prefix="/tickets", tags=["tickets"])
 
 
 @router.post("", response_model=TicketAck, status_code=status.HTTP_201_CREATED)
-def submit_ticket(payload: TicketCreate, db: DbSession) -> TicketAck:
+def submit_ticket(
+    payload: TicketCreate,
+    db: DbSession,
+    llm: LLMProvider,  # ← CHANGE
+    embedder: EmbeddingProvider,  # ← CHANGE
+) -> TicketAck:
     """Accept a customer ticket and triage it.
 
     Public: no authentication. Rate limiting is Day 12.
@@ -40,7 +45,7 @@ def submit_ticket(payload: TicketCreate, db: DbSession) -> TicketAck:
     )
 
     try:
-        ticket = process_ticket(db, ticket.id)
+        ticket = process_ticket(db, ticket.id, llm=llm, embedder=embedder)  # ← CHANGE
     except Exception:
         # process_ticket has already marked the ticket FAILED and logged
         # the traceback. The receipt below is still accurate.
@@ -77,7 +82,12 @@ def _progress_event(node_name: str, changes: dict) -> dict:
 
 
 @router.post("/stream")
-def submit_ticket_streaming(payload: TicketCreate, db: DbSession) -> StreamingResponse:
+def submit_ticket_streaming(
+    payload: TicketCreate,
+    db: DbSession,
+    llm: LLMProvider,  # ← CHANGE
+    embedder: EmbeddingProvider,  # ← CHANGE
+) -> StreamingResponse:
     """Submit a ticket and stream triage progress as each node completes.
 
     Same contract as POST /tickets, delivered live. Progress only — the
@@ -98,7 +108,7 @@ def submit_ticket_streaming(payload: TicketCreate, db: DbSession) -> StreamingRe
             ticket.status = TicketStatus.PROCESSING
             db.commit()
 
-            graph = build_triage_graph(db)
+            graph = build_triage_graph(db, llm=llm, embedder=embedder)  # ← CHANGE
             result: dict = {}
 
             for update in graph.stream(

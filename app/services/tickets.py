@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.graph.triage import build_triage_graph
 from app.models.ticket import Ticket, TicketStatus
 from app.models.ticket_citation import TicketCitation
+from app.services.providers import Embedder, LLMClient  # ← CHANGE
 from app.services.retrieval import RetrievedChunk
 
 logger = logging.getLogger(__name__)
@@ -75,10 +76,18 @@ def mark_failed(db: Session, ticket_id: uuid.UUID, reason: str) -> None:
     db.commit()
 
 
-def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
+def process_ticket(
+    db: Session,
+    ticket_id: uuid.UUID,
+    *,
+    llm: LLMClient,  # ← CHANGE
+    embedder: Embedder,  # ← CHANGE
+) -> Ticket:
     """Run the ticket through the triage graph and persist the outcome.
 
-    The graph decides; this function owns the database.
+    The graph decides; this function owns the database. The LLM client and
+    embedder are passed in by the caller, so this function never chooses a
+    provider itself.
     """
     ticket = db.get(Ticket, ticket_id)
     if ticket is None:
@@ -88,7 +97,7 @@ def process_ticket(db: Session, ticket_id: uuid.UUID) -> Ticket:
     db.commit()
 
     try:
-        graph = build_triage_graph(db)
+        graph = build_triage_graph(db, llm=llm, embedder=embedder)  # ← CHANGE
         result = graph.invoke(
             {
                 "ticket_id": ticket.id,

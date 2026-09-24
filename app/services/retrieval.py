@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
 from app.models.document import Document
-from app.services.embeddings import embed_text
+from app.services.providers import Embedder  # ← CHANGE 1 (replaces the embed_text import)
 
 DEFAULT_TOP_K = 3
 
@@ -27,10 +27,13 @@ def search_chunks(
     db: Session,
     query: str,
     *,
+    embedder: Embedder,  # ← CHANGE 2 (new required keyword argument)
     top_k: int = DEFAULT_TOP_K,
 ) -> list[RetrievedChunk]:
     """Return the top_k chunks most similar to `query`, best first."""
-    query_embedding = embed_text(query, task_type="RETRIEVAL_QUERY", use_cache=True)
+    query_embedding = embedder.embed(  # ← CHANGE 3 (was embed_text(...))
+        query, task_type="RETRIEVAL_QUERY", use_cache=True
+    )
 
     distance = Chunk.embedding.cosine_distance(query_embedding)
 

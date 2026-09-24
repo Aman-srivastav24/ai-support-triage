@@ -4,7 +4,7 @@ This is where our own exceptions become HTTP status codes.
 """
 
 from __future__ import annotations
-
+from app.services.providers import Embedder, LLMClient, get_embedder, get_llm
 import uuid
 from typing import Annotated
 
@@ -25,7 +25,8 @@ _CREDENTIALS_ERROR = HTTPException(
 )
 
 DbSession = Annotated[Session, Depends(get_db)]
-
+LLMProvider = Annotated[LLMClient, Depends(get_llm)]
+EmbeddingProvider = Annotated[Embedder, Depends(get_embedder)]
 
 def get_current_user(
     db: DbSession,

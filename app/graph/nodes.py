@@ -3,6 +3,10 @@
 Each node takes the full state and returns only the keys it changed.
 Nodes contain no business logic: they call services that already exist
 and shape the result into state. The graph decides order; services do work.
+
+Nodes that need an external client (database, LLM, embedder) are built by
+factories that close over it. Clients belong to the request, not to the
+graph's state.
 """
 
 import logging
@@ -13,7 +17,7 @@ from app.core.config import get_settings
 from app.graph.state import TriageState
 from app.schemas.classification import TicketCategory
 from app.services.cache import get_json, make_key, set_json
-from app.services.llm import classify_ticket, draft_answer
+from app.services.providers import Embedder, LLMClient  # ← CHANGE (replaces llm import)
 from app.services.retrieval import search_chunks
 
 logger = logging.getLogger(__name__)
@@ -46,22 +50,29 @@ def _build_query(state: TriageState) -> str:
     return f"{subject}\n{state['body']}" if subject else state["body"]
 
 
-def classify(state: TriageState) -> dict:
-    """Decide what kind of ticket this is."""
-    category = classify_ticket(state["subject"], state["body"])
-    logger.info("ticket %s classified as %s", state["ticket_id"], category.value)
-    return {"category": category}
+def make_classify_node(llm: LLMClient):  # ← CHANGE (was a plain function)
+    """Build the classify node, bound to this request's LLM client."""
+
+    def classify(state: TriageState) -> dict:
+        """Decide what kind of ticket this is."""
+        category = llm.classify(state["subject"], state["body"])  # ← CHANGE
+        logger.info("ticket %s classified as %s", state["ticket_id"], category.value)
+        return {"category": category}
+
+    return classify
 
 
-def make_retrieve_node(db: Session):
-    """Build the retrieve node, bound to this request's database session.
+def make_retrieve_node(db: Session, embedder: Embedder):  # ← CHANGE (added embedder)
+    """Build the retrieve node, bound to this request's session and embedder.
 
-    The session is closed over rather than carried in state: it belongs to
-    the request, not to the graph.
+    Both are closed over rather than carried in state: they belong to the
+    request, not to the graph.
     """
 
     def retrieve(state: TriageState) -> dict:
-        results = search_chunks(db, _build_query(state), top_k=TOP_K)
+        results = search_chunks(
+            db, _build_query(state), embedder=embedder, top_k=TOP_K  # ← CHANGE
+        )
         kept = [c for c in results if c.similarity >= SIMILARITY_FLOOR]
         logger.info(
             "ticket %s retrieved %d chunks, %d above floor",
@@ -74,38 +85,45 @@ def make_retrieve_node(db: Session):
     return retrieve
 
 
-def draft(state: TriageState) -> dict:
-    """Draft a grounded reply from the retrieved chunks.
+def make_draft_node(llm: LLMClient):  # ← CHANGE (was a plain function)
+    """Build the draft node, bound to this request's LLM client."""
 
-    Cached on the question AND the chunk IDs, because unlike classification
-    this output depends on the corpus, not just the input. A short TTL backs
-    that up: keying on chunk IDs catches a different retrieval, but not an
-    edit to a document that keeps the same chunks.
-    """
-    chunks = state["chunks"]
+    def draft(state: TriageState) -> dict:
+        """Draft a grounded reply from the retrieved chunks.
 
-    if not chunks:
-        # Nothing cleared the floor. Calling the model with no context would
-        # spend an API call to produce the refusal sentence we can write here.
-        return {"draft": REFUSAL_SENTENCE}
+        Cached on the question AND the chunk IDs, because unlike classification
+        this output depends on the corpus, not just the input. A short TTL backs
+        that up: keying on chunk IDs catches a different retrieval, but not an
+        edit to a document that keeps the same chunks.
+        """
+        chunks = state["chunks"]
 
-    query = _build_query(state)
-    settings = get_settings()
+        if not chunks:
+            # Nothing cleared the floor. Calling the model with no context would
+            # spend an API call to produce the refusal sentence we can write here.
+            return {"draft": REFUSAL_SENTENCE}
 
-    # Chunk IDs are part of the key: the same question over different
-    # retrieved context is a different question. Sorted so the fingerprint
-    # is stable for the same set of chunks regardless of retrieval order.
-    chunk_fingerprint = ",".join(sorted(c.chunk_id for c in chunks))
-    cache_key = make_key("draft", settings.groq_model, f"{query}||{chunk_fingerprint}")
+        query = _build_query(state)
+        settings = get_settings()
 
-    cached = get_json(cache_key)
-    if cached is not None:
-        logger.info("draft cache hit")
-        return {"draft": cached}
+        # Chunk IDs are part of the key: the same question over different
+        # retrieved context is a different question. Sorted so the fingerprint
+        # is stable for the same set of chunks regardless of retrieval order.
+        chunk_fingerprint = ",".join(sorted(c.chunk_id for c in chunks))
+        cache_key = make_key(
+            "draft", settings.groq_model, f"{query}||{chunk_fingerprint}"
+        )
 
-    answer = draft_answer(query, [c.content for c in chunks])
-    set_json(cache_key, answer, ttl_seconds=DRAFT_CACHE_TTL_SECONDS)
-    return {"draft": answer}
+        cached = get_json(cache_key)
+        if cached is not None:
+            logger.info("draft cache hit")
+            return {"draft": cached}
+
+        answer = llm.draft(query, [c.content for c in chunks])  # ← CHANGE
+        set_json(cache_key, answer, ttl_seconds=DRAFT_CACHE_TTL_SECONDS)
+        return {"draft": answer}
+
+    return draft
 
 
 def score_confidence(state: TriageState) -> dict:
