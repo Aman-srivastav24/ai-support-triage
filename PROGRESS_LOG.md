@@ -70,8 +70,11 @@ Managed auth would remove the entire Day 2 build — JWT, bcrypt, `get_current_u
 RBAC. Those are the most-interviewed backend topics in this project.
 
 **Neon over Render Postgres**
-Render's free Postgres expires after 30 days. Neon's free tier is permanent and does not
-pause on inactivity, which matters when a reviewer opens the link weeks after applying.
+Render's free Postgres is deleted after 30 days; Neon's free-tier data is
+permanent. *Corrected on Day 5:* the compute is not always on. It scales to
+zero after 5 minutes idle (fixed on the free plan) and wakes on the next query
+in a few hundred milliseconds. `pool_pre_ping=True` (Day 1) is what makes the
+dropped connections harmless.
 
 **SSH over HTTPS + token for GitHub auth**
 No token expiry to manage, and it matches what most workplaces use.
@@ -1016,3 +1019,190 @@ model, prompt and chunks. Live evidence for why tests fake the LLM.
 - **Closed today:** imports inside `get_document`; `session.py` module-level
   settings (resolved by import order + guard, not refactor); Day 3's
   "`POST /tickets` has not been called yet".
+
+  ## Day 5 (part 2) — Agent endpoint, deployment, frontend, README
+
+**Date:** 24–25 Sep 2026
+
+### Built
+
+- `GET /tickets/{id}` — agent-facing, JWT required. `TicketRead` extended
+  with `subject`, `body`, `customer_email`, `created_at`.
+  `get_ticket_with_citations` loads a ticket and its citations in two queries.
+- Upstash Redis (Singapore, TLS, eviction on)
+- `Dockerfile` hardened: listens on `$PORT`, `exec` so uvicorn is PID 1,
+  runs as unprivileged `appuser`
+- Neon production schema built with `alembic upgrade head` from WSL
+- Render web service: Docker, Singapore, free tier, health check `/health`,
+  auto-deploy on commit — https://ai-support-triage-4qzy.onrender.com/
+- `scripts/seed_production.py` — idempotent: demo agent, admin (SQL
+  promotion, verified via the deployed `/auth/me`), sample documents with
+  polling until `ready`
+- Production seeded: demo agent, admin, 3 documents ingested with Gemini
+  called from Render
+- Frontend `app/static/index.html`, served by FastAPI at `/`: customer panel
+  streams triage progress; agent panel logs in and shows draft, confidence,
+  sources and an escalation banner
+- `.env.example` rewritten; `README.md` written
+- Tests: 23 → 28 (agent endpoint ×3, frontend ×3, config ×2)
+- Commits: `a089b3f` agent endpoint · `fe894f5` Dockerfile · `3abd110` seed
+  script · `79a11f0` frontend · `949c404` `.env.example` · README
+
+### What broke
+
+**1. The Upstash URL was pasted as a `.env` line**
+`REDIS_URL="rediss://..."` went into the variable, quotes included. redis-py
+rejected the scheme. Printing only the part before the first `:`
+(`${VAR%%:*}`) diagnosed it without revealing the secret. The clean-up
+commands were then skipped once, so it failed again with the same error.
+
+**2. Placeholders and a missing space**
+`PASTE_ID_HERE` sent twice (422 in production). A missing space before `-H`
+made curl read the header as a second URL, so the request went out with no
+`Authorization` header (401). Fix: put values in variables, never splice
+them into commands.
+
+**3. The demo password shipped wrong, because a check was skipped**
+`123456789` was typed at a hidden `getpass` prompt, twice. The login check
+built to catch this was reported as "done" without output, so the wrong
+password reached production and was only found in the browser. Fixed by
+re-registering with the password visible in the command, then verified:
+`triage-demo-2026 -> 200`, `123456789 -> 401`.
+
+**4. The app hung instead of failing**
+`main.py` mounted `app/static` before the folder existed. `StaticFiles`
+checks at startup, so the app crashed; under `--reload` the reloader kept
+port 8000 open, so requests hung rather than being refused. `--reload` only
+watches `.py` files, so creating the folder didn't recover it. Fixed with a
+restart. Now every `curl` in a check uses `--max-time`.
+
+**5. 23 tests instead of 26**
+The new test file wasn't saved yet. Same class as Day 1's unsaved buffer.
+
+**6. `.env.example` had drifted**
+`GROK_API_KEY` (a typo for `GROQ`), `JWT_SECRET_KEY` and `GEMINI_API_KEY`
+missing, and an `ENVIRONMENT` line with no `=`. Anyone following it would hit
+`Field required`. `pydantic-settings` ignores unknown variables silently,
+which is how the typo went unnoticed. Now tested.
+
+**7. Security finding after deploy: open registration grants staff access**
+`POST /auth/register` is public and creates agents; agents read every
+ticket. Harmless on a laptop, real once deployed. Demonstrated by using it
+to re-create the demo account. Deferred to Day 12, stated in the README.
+
+**8. A Day 0 claim was wrong**
+Neon's free compute does scale to zero. Found by checking current docs
+before deploying. Corrected in the Day 0 entry.
+
+### Decisions
+
+**Agent endpoint behind JWT, with a published demo login**
+Instead of a public demo endpoint, which would have undone Day 4's rule
+that drafts and scores stay private. Weakness: anyone with the demo login
+reads every ticket. Mitigated by a fake prefilled email and a notice on
+the page.
+
+**No per-ticket ownership check**
+Every account is staff, and staff read the whole queue. The docstring
+records that customer accounts would require one (IDOR, OWASP API #1:
+broken object level authorization).
+
+**Citations via one explicit join, selecting four columns**
+Walking relationships lazily is N+1 (8 queries for 3 citations). Eager
+loading fixes the count but pulls `Document.raw_text`, the whole file,
+just for a title. Verified with `engine.echo`: two queries.
+
+**`uuid.UUID` path parameter**
+A malformed ID gets 422 from FastAPI. `get_document` returns 404 for the
+same input. The two are now inconsistent; recorded, not fixed.
+
+**Everything in Singapore**
+Measured from Delhi: every Upstash command costs ~93 ms. Same-region
+calls from Render are around 1 ms.
+
+**Neon direct connection, `postgresql+psycopg://`**
+Not the pooler: one long-running process with its own SQLAlchemy pool,
+and migrations need a direct connection. The prefix matters: plain
+`postgresql://` means psycopg2, which isn't installed.
+
+**Separate production JWT secret**
+A leaked dev secret must not be able to sign production tokens.
+
+**Health check `/health` on Render**
+Gates each deploy: a version that can't reach Neon or Upstash never
+replaces a working one. Cost: a query on Neon and a new Upstash TLS
+connection on every probe. Frequency not yet measured.
+
+**Container: `$PORT`, `exec`, non-root**
+The platform picks the port. `exec` makes uvicorn PID 1 so SIGTERM reaches
+it and it shuts down gracefully. Root would give an attacker full control
+of the container.
+
+**Seed script talks HTTP only and imports nothing from `app`**
+So local `.env` settings can never leak into a production operation.
+Idempotent (409 counts as done). Verifies through the deployed
+`/auth/me` that the promotion reached the same database the app uses.
+
+**Frontend served from the same origin**
+No CORS configuration. Setting CORS to `*` to silence errors is the
+classic mistake of the alternative.
+
+**Streaming read with `fetch`, not `EventSource`**
+`EventSource` can only GET. The reader buffers bytes and parses only
+complete events, because network chunks don't line up with events.
+
+**`textContent` only; token in memory in a module script**
+The agent view shows text from strangers and from an LLM they can
+influence. Verified by submitting `<img src=x onerror=...>`: displayed
+literally. Enforced by a test that fails if `innerHTML` appears. In-memory
+token reduces, not prevents, XSS damage; an HttpOnly cookie is the
+production answer.
+
+**Confidence labelled "top source similarity, not a probability"**
+0.66 does not mean 66% likely correct.
+
+**Reply-to-customer deferred**
+Showing agent replies to customers needs a customer access design. Using
+the ticket ID as the key turns it into a secret, and staff tools expose it.
+The proper design is a per-ticket customer token. Recorded as "what I'd do
+next."
+
+**`.env.example` checked by a test**
+Every required setting present, and no unknown names.
+
+### Numbers
+
+| Metric | Value |
+|---|---|
+| Agent endpoint queries | 2, whatever the citation count (verified) |
+| Upstash from Delhi | 815 ms first PING (connect + TLS), 93 ms reused |
+| Neon from Delhi, warm | 1559 ms connect + first query (not a cold start: migrations had just woken it) |
+| `docker stop` with `exec` | 0.885 s (the no-`exec` case was not measured) |
+| Production `/health` from Delhi | 0.81 s, then 0.27 s (the gap is probably DNS; not measured) |
+| **Production cold ticket, streamed** | **2.09 s**, drafted (local cold: 2.04–2.11 s) |
+| Production in browser | 1.25 s, partly cached; not a cold number |
+| Local browser, cold / partly cached | 2.43 s / 1.05 s |
+| Test suite | 28 tests, ~6.5 s |
+| Production Postgres / pgvector | 18.6 / 0.8.6 (local: 16) |
+| Render | port 10000, `WEB_CONCURRENCY=1` |
+
+### Open items
+
+- **Day 12:** close registration by default, add admin-created accounts,
+  rate limiting
+- **Measure:** time between Render health-check calls (log timestamps);
+  Neon and Upstash usage dashboards
+- `/health` opens a new Redis connection per call
+- **Day 7:** Compose to `pgvector/pgvector:pg18` to match production (needs
+  a volume reset)
+- Migrations are manual on Neon: run them *before* pushing code that needs them
+- Dockerfile reinstalls all dependencies on any code change
+- Separate production Groq and Gemini keys, if dev keys were reused
+- Ticket tests read the database directly (`stored()`); move them to the
+  agent endpoint
+- `get_document` (404) vs `get_ticket` (422) on malformed IDs
+- **Unverified:** README Mermaid diagrams render on GitHub
+- 90-second walkthrough done out loud, not reviewed
+- Carried: suspected Redis has no persistence volume; draft cache key uses
+  `settings.groq_model`
+- **Closed:** agent endpoint; Upstash TLS; demo password; `.env.example`
