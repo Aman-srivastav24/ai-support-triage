@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Support Triage</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; line-height: 1.5; color: #1f2328; background: #f6f8fa; }
+    body { max-width: 760px; margin: 2rem auto; padding: 0 1rem; }
+    section { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 1.25rem; margin-bottom: 1.5rem; }
+    label { display: block; font-weight: 600; margin-top: .75rem; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: .5rem; font: inherit; border: 1px solid #d0d7de; border-radius: 6px; }
+    textarea { min-height: 7rem; resize: vertical; }
+    button { margin-top: 1rem; padding: .5rem 1rem; font: inherit; border: 0; border-radius: 6px; background: #1f6feb; color: #fff; cursor: pointer; }
+    button:disabled { background: #8c959f; cursor: wait; }
+    .notice { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: .5rem .75rem; font-size: .9rem; }
+    .muted { color: #57606a; font-size: .9rem; }
+    .error { color: #cf222e; }
+    #progress { padding-left: 1.25rem; }
+    #progress li { padding: .15rem 0; }
+    .banner { padding: .6rem .8rem; border-radius: 6px; font-weight: 600; margin-top: 1rem; }
+    .banner.bad  { background: #ffebe9; border: 1px solid #ff8182; color: #82071e; }
+    .banner.good { background: #dafbe1; border: 1px solid #4ac26b; color: #116329; }
+    .facts { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; }
+    .facts dt { font-weight: 600; }
+    .facts dd { margin: 0; }
+    .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .draft { background: #f6f8fa; border-left: 3px solid #1f6feb; padding: .5rem .75rem; }
+  </style>
+</head>
+<body>
+  <h1>AI Support Triage</h1>
+  <p class="muted">
+    Tickets are classified, matched against support documentation, and drafted
+    for a human agent. Nothing is ever sent to the customer automatically.
+  </p>
+
+  <section>
+    <h2>1. Submit a ticket (as a customer)</h2>
+    <p class="notice">
+      Demo site. Don't enter real personal data: anyone with the published demo
+      agent login can read submitted tickets.
+    </p>
+    <form id="ticket-form">
+      <label for="subject">Subject</label>
+      <input id="subject" required minlength="3" maxlength="200" value="Refund question">
+
+      <label for="body">Message</label>
+      <textarea id="body" required minlength="10" maxlength="5000">How many days do I have to ask for a refund after my first payment?</textarea>
+
+      <label for="email">Email</label>
+      <input id="email" required maxlength="320" value="customer@example.com">
+
+      <button id="submit" type="submit">Submit ticket</button>
+    </form>
+    <ol id="progress"></ol>
+    <p id="submit-error" class="error" hidden></p>
+  </section>
+
+  <section id="agent" hidden>
+    <h2>2. Review the draft (as a support agent)</h2>
+    <p class="notice">
+      Published demo login, prefilled below. It is a real agent account and can
+      read every submitted ticket.
+    </p>
+    <label for="agent-email">Agent email</label>
+    <input id="agent-email" value="demo-agent@example.com" autocomplete="username">
+
+    <label for="agent-password">Password</label>
+    <input id="agent-password" type="password" value="triage-demo-2026" autocomplete="current-password">
+
+    <button id="load-draft" type="button">Log in and load the draft</button>
+    <p id="agent-error" class="error" hidden></p>
+
+    <div id="result" hidden>
+      <p id="banner" class="banner"></p>
+      <dl class="facts">
+        <dt>Status</dt><dd id="r-status"></dd>
+        <dt>Category</dt><dd id="r-category"></dd>
+        <dt>Confidence</dt><dd id="r-confidence"></dd>
+      </dl>
+      <h3>Customer's question</h3>
+      <p id="r-subject"><strong></strong></p>
+      <p id="r-body" class="text"></p>
+      <h3>Suggested reply</h3>
+      <p id="r-draft" class="text draft"></p>
+      <h3>Sources</h3>
+      <ol id="r-sources"></ol>
+    </div>
+  </section>
+
+  <!-- type="module": top-level variables (including the token) are not global,
+       so other scripts on the page cannot read them by name. -->
+  <script type="module">
+    // ---------- Customer panel ----------
+
+    const form = document.getElementById("ticket-form");
+    const submitButton = document.getElementById("submit");
+    const progress = document.getElementById("progress");
+    const submitError = document.getElementById("submit-error");
+
+    let currentTicketId = null;
+
+    function describe(event) {
+      switch (event.stage) {
+        case "received":   return "Ticket received";
+        case "classified": return `Classified as ${event.category}`;
+        case "retrieved":  return `Found ${event.sources} relevant source(s)`;
+        case "drafted":    return "Draft written";
+        case "scored":     return event.escalate ? "Flagged for human review" : "Draft ready for agent review";
+        case "done":       return `Finished: ${event.status}`;
+        case "error":      return "Triage failed. The ticket is saved and a human will pick it up.";
+        default:           return null;
+      }
+    }
+
+    function showStep(text, startedAt) {
+      const item = document.createElement("li");
+      const seconds = ((performance.now() - startedAt) / 1000).toFixed(2);
+      item.textContent = `${text}  (+${seconds}s)`;
+      progress.append(item);
+    }
+
+    // Network chunks do not line up with events: buffer bytes and parse only
+    // complete events (ending in a blank line); keep the tail for next time.
+    async function readEvents(response, onEvent) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          for (const line of rawEvent.split("\n")) {
+            if (line.startsWith("data: ")) onEvent(JSON.parse(line.slice(6)));
+          }
+        }
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      submitButton.disabled = true;  // a double click must not create two tickets
+      progress.replaceChildren();
+      submitError.hidden = true;
+      document.getElementById("result").hidden = true;
+      currentTicketId = null;
+      const startedAt = performance.now();
+
+      try {
+        const response = await fetch("/tickets/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            subject: document.getElementById("subject").value,
+            body: document.getElementById("body").value,
+            customer_email: document.getElementById("email").value,
+          }),
+        });
+        if (!response.ok) {
+          throw new Error(`The server rejected the ticket (HTTP ${response.status}).`);
+        }
+        await readEvents(response, (event) => {
+          const text = describe(event);
+          if (text) showStep(text, startedAt);
+          if (event.stage === "done") currentTicketId = event.id;
+        });
+        if (currentTicketId) document.getElementById("agent").hidden = false;
+      } catch (err) {
+        submitError.textContent = err.message;
+        submitError.hidden = false;
+      } finally {
+        submitButton.disabled = false;
+      }
+    });
+
+    // ---------- Agent panel ----------
+
+    const loadButton = document.getElementById("load-draft");
+    const agentError = document.getElementById("agent-error");
+
+    // In memory only: gone on reload. Not localStorage, which any injected
+    // script could read. See the XSS notes in the progress log.
+    let token = null;
+
+    async function login() {
+      const response = await fetch("/auth/login", {
+        method: "POST",
+        // URLSearchParams sends form fields, as OAuth2PasswordRequestForm expects.
+        body: new URLSearchParams({
+          username: document.getElementById("agent-email").value,
+          password: document.getElementById("agent-password").value,
+        }),
+      });
+      if (!response.ok) throw new Error("Login failed. Check the demo credentials.");
+      token = (await response.json()).access_token;
+    }
+
+    function fetchTicket(id) {
+      return fetch(`/tickets/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    }
+
+    // EVERY value from the server goes in through textContent: the body was
+    // typed by a stranger and the draft was written by a model the stranger
+    // could influence. Neither is ever parsed as HTML.
+    function setText(id, text) {
+      document.getElementById(id).textContent = text;
+    }
+
+    function render(ticket) {
+      const needsHuman = ticket.status === "escalated" || ticket.status === "failed";
+      const banner = document.getElementById("banner");
+      banner.className = `banner ${needsHuman ? "bad" : "good"}`;
+      banner.textContent = needsHuman
+        ? `Needs a human: ${ticket.escalation_reason ?? "triage did not complete"}`
+        : "Draft ready. Review it before replying to the customer.";
+
+      setText("r-status", ticket.status);
+      setText("r-category", ticket.category ?? "—");
+      setText(
+        "r-confidence",
+        ticket.confidence == null
+          ? "—"
+          : `${ticket.confidence.toFixed(3)} (top source similarity, not a probability)`,
+      );
+      document.querySelector("#r-subject strong").textContent = ticket.subject ?? "";
+      setText("r-body", ticket.body);
+      setText("r-draft", ticket.draft_reply ?? "(no draft)");
+
+      const sources = document.getElementById("r-sources");
+      sources.replaceChildren(
+        ...ticket.citations.map((c) => {
+          const item = document.createElement("li");
+          item.textContent = `${c.document_title} (similarity ${c.similarity.toFixed(3)})`;
+          return item;
+        }),
+      );
+      document.getElementById("result").hidden = false;
+    }
+
+    loadButton.addEventListener("click", async () => {
+      loadButton.disabled = true;
+      agentError.hidden = true;
+      try {
+        if (!token) await login();
+        let response = await fetchTicket(currentTicketId);
+        if (response.status === 401) {
+          // Tokens expire after 60 minutes: log in again once, then retry.
+          token = null;
+          await login();
+          response = await fetchTicket(currentTicketId);
+        }
+        if (!response.ok) throw new Error(`Could not load the ticket (HTTP ${response.status}).`);
+        render(await response.json());
+      } catch (err) {
+        agentError.textContent = err.message;
+        agentError.hidden = false;
+      } finally {
+        loadButton.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
