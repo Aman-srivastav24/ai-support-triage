@@ -44,7 +44,14 @@ LABEL_TO_TITLE = {
 
 # Seconds between tickets. Each ticket makes up to two Groq calls; this keeps
 # a full run well under free-tier per-minute limits.
-PAUSE_SECONDS = 4.0
+# Groq free tier for openai/gpt-oss-20b: 8,000 tokens per minute (the binding
+# limit; 30 RPM is not). A ticket is roughly 2,500 tokens (estimate: classify
+# ~300 + draft with 3 chunks and reasoning ~2,000), so ~3 tickets per minute.
+# 25 s gives headroom for reasoning-token variance.
+PAUSE_SECONDS = 25.0
+
+# If a ticket still hits a 429, the per-minute bucket refills fully in 60 s.
+RETRY_WAIT_SECONDS = 60.0
 RESULTS_DIR = Path(__file__).parent / "results"
 
 @dataclass
@@ -215,7 +222,7 @@ def save_run(results: list[TicketResult], summary: dict) -> Path:
         "meta": {
             "saved_at": started.isoformat(timespec="seconds"),
             "git_commit": _git("rev-parse", "--short", "HEAD"),
-            "uncommitted_changes": bool(_git("status", "--porcelain", "--untracked-files=no")),,
+            "uncommitted_changes": bool(_git("status", "--porcelain", "--untracked-files=no")),
             "groq_model": get_settings().groq_model,
             "top_k": TOP_K,
             "similarity_floor": SIMILARITY_FLOOR,
@@ -242,6 +249,10 @@ if __name__ == "__main__":
             if i:
                 time.sleep(PAUSE_SECONDS)
             r = evaluate_ticket(db, graph, embedder, ticket)
+            if r.error and "429" in r.error:
+                print(f"#{ticket['id']:<3} rate-limited, waiting {RETRY_WAIT_SECONDS:.0f}s, retrying once")
+                time.sleep(RETRY_WAIT_SECONDS)
+                r = evaluate_ticket(db, graph, embedder, ticket)
             print_row(r)
             results.append(r)
     finally:
